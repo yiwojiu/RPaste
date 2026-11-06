@@ -1,0 +1,55 @@
+[package]
+name = "rpaste"
+version = "0.1.0"
+edition = "2024"
+description = "Windows 剪贴板历史工具：Alt+V 唤出，内存索引搜索，支持文本、图片与文件"
+authors = ["yiwojiu"]
+license = "Apache-2.0"
+repository = "https://github.com/yiwojiu/RPaste"
+readme = "README.md"
+keywords = ["clipboard", "windows", "productivity", "egui"]
+categories = ["gui", "os::windows-apis"]
+# 这是应用不是库：内置字体 2.4MB，也不打算往 crates.io 发。
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+crossbeam-channel = "0.5.17"
+# 关掉 accesskit（Windows UIA 无障碍支持，常驻几十 MB 且这里用不到）
+# 和 x11/wayland（Windows 专用构建）。只保留 glow 渲染 + 默认字体。
+eframe = { version = "0.33.3", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+egui_extras = { version = "0.33.3", features = ["image"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[build-dependencies]
+winresource = "0.1.34"

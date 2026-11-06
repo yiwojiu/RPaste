@@ -1,0 +1,7 @@
+# 统一用 LF：跨平台 diff 干净，Windows 上的编辑器也都支持。
+* text=auto eol=lf
+
+# 二进制资源，禁止任何行尾转换
+*.png binary
+*.ico binary
+*.ttf binary

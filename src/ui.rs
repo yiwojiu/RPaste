@@ -1,0 +1,1876 @@
+//! egui 界面。只读查询走 `ReadStore`，写回走 worker 的 channel。
+//!
+//! 设计约定：
+//! - 每个元素都要有紧凑的卡片样式，历史列表按时间倒序。
+//! - 点选一条 → 发 `Command::CopyText` 给 worker，同时把窗口隐藏。
+//! - 点关闭按钮不退出，只是隐藏到托盘；退出走托盘菜单。
+//! - 显示/隐藏一律调 `win::window` 里的 Win32 函数，**不要用 egui 的
+//!   `ViewportCommand::Visible`**：窗口隐藏后 winit 不再派发重绘，
+//!   `update` 不执行，任何依赖 update 的逻辑都会失效。
+//! - UI 每次收到 worker 的更新提示（`Notify`）就同步内存索引：增量拉新条目，
+//!   条数和库里对不上就全量重建（见 `crate::search`）。
+
+use eframe::egui;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use crate::capture::{Command, CopyRequest};
+use crate::model::{Kind, denormalize_newlines};
+use crate::search::{Counts, Index, KindFilter, match_ranges};
+use crate::store::{EntryMeta, ReadStore};
+use crate::thumb::{PreviewState, Thumb, Thumbs};
+use crate::win;
+
+const RECENT_LIMIT: usize = 200;
+
+/// 列表里每条预览最多占几行。
+///
+/// 长文本（配置、日志、一段 SQL）折行后能把整个窗口吃掉，列表就失去
+/// 「一眼扫过去」的作用；只给一行又常常看不出这条讲什么。两行是平衡点，
+/// 全文交给空格打开的浮层。
+const PREVIEW_ROWS: usize = 2;
+
+/// 列表预览最多参与排版的字符数。
+///
+/// 存储用的预览是 512 字，但两行无论如何显示不下这么多；不截的话每帧都要
+/// 为 200 行各排版 512 字，纯属白烧。240 字已经超过两行的容量。
+const PREVIEW_SHOW_CHARS: usize = 240;
+
+/// 搜索时列表显示的命中上下文长度（字符）。
+///
+/// 命中点前后各留一段，让用户看出「为什么这条被选中」——长文本只显示开头
+/// 时，命中的词经常在 5000 字之后，光看开头会以为搜索坏了。
+const SNIPPET_CHARS: usize = 120;
+
+/// 全文浮层最多渲染的字符数。
+///
+/// 单条内容上限是 64MB，直接丢给 `LayoutJob` 会把界面卡死几秒。32K 字
+/// （约 20 屏）足够读完任何「刚复制的一段东西」，再多请回原程序里看。
+const TEXT_VIEW_CHARS: usize = 32 * 1024;
+
+/// 列表里图片缩略图的高度。
+///
+/// 和文本条目两行的高度基本一致（约 44px），这样图片行换上去不会把
+/// 列表节奏打乱。
+const THUMB_H: f32 = 44.0;
+/// 缩略图最大宽度。
+///
+/// 不用「塞进正方形」的算法：591×258 这种宽图按高度缩放只剩 19px 高，
+/// 白底截图基本什么都看不出来。改成高度固定、宽度封顶，宽图能多占些
+/// 横向像素，行高依然是统一的 44。
+const THUMB_MAX_W: f32 = 96.0;
+
+/// `egui::Context` 是 `Send + Sync`，留给后台守护线程用。
+///
+/// **为什么需要它**：窗口被 `SW_HIDE` 收进托盘后 Windows 不再发 `WM_PAINT`。
+/// eframe 0.33 的 `run.rs::check_redraw_requests()` 一遇到期的重绘请求就把
+/// `ControlFlow` 设成 `Poll`，指望 `window.request_redraw()` 带来下一帧
+/// `RedrawRequested` 再改回 `Wait`——隐藏窗口等不来这一帧，主循环就永久空转，
+/// 实测跑满一个逻辑核（96.8%，任务管理器里约 12%）。此时 `App::update`
+/// 根本不被调用（实测隐藏 8 秒只有帧 0），应用层没法自己救自己。
+///
+/// 守护线程在窗口隐藏期间每 500ms 手动补发一个 `WM_PAINT`（见
+/// `win::poke_repaint`），替 winit 把缺失的 `RedrawRequested` 补上；同时塞一个
+/// 远期重绘请求让 `check_redraw_requests` 走 `WaitUntil`。实测单核 CPU
+/// 96.8% → 1.87%。窗口可见时什么都不发，正常渲染不受影响。
+pub static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// 启动主循环守护线程。窗口隐藏时每 500ms 补一帧，把 `ControlFlow` 按回 `Wait`。
+pub fn spawn_repaint_guard() {
+    let started = std::thread::Builder::new()
+        .name("rpaste-repaint-guard".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if win::is_main_window_visible() {
+                    continue;
+                }
+
+                // 关键是这一帧 WM_PAINT：它让 winit 派发 RedrawRequested，
+                // eframe 才能走完 run_ui_and_paint 并返回 EventResult::Wait。
+                win::poke_repaint();
+                // 顺带塞一个远期重绘时间，让 check_redraw_requests 走 WaitUntil，
+                // 避免在 Poll 上多空转一轮。
+                if let Some(ctx) = EGUI_CTX.get() {
+                    ctx.request_repaint_after(std::time::Duration::from_secs(3600));
+                }
+            }
+        });
+    if started.is_err() {
+        crate::log_error!("无法启动 repaint guard 线程");
+    }
+}
+
+/// 「清空历史」的确认有效期。清空不可撤销，所以点两次才执行；
+/// 两次之间超过这个时间就当用户放弃了，按钮收回待确认态。
+const CLEAR_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `Alt+1..9` 对应的数字键，顺序即「列表第几条」。
+const QUICK_PASTE_KEYS: [egui::Key; 9] = [
+    egui::Key::Num1,
+    egui::Key::Num2,
+    egui::Key::Num3,
+    egui::Key::Num4,
+    egui::Key::Num5,
+    egui::Key::Num6,
+    egui::Key::Num7,
+    egui::Key::Num8,
+    egui::Key::Num9,
+];
+
+pub struct App {
+    read: ReadStore,
+    tx: crossbeam_channel::Sender<Command>,
+    notify: crossbeam_channel::Receiver<()>,
+    /// 内存检索索引：全量条目都在这里，列表和搜索都从它取。
+    ///
+    /// 和数据库的唯一关系是「下次刷新时对齐条数」——对不上就全量重建，
+    /// 所以增量同步写错也不会留下永久不一致。
+    index: Index,
+    entries: Vec<EntryMeta>,
+    search: String,
+    /// 当前类型筛选。列表和搜索都受它约束。
+    filter: KindFilter,
+    /// 各类型条数，刷新时算一次，供顶部 chip 显示。
+    counts: Counts,
+    /// 需要重查数据库的信号（worker 提示或首次启动）。
+    dirty: bool,
+    /// 最近一次操作的状态提示，短暂显示在底部。
+    toast: Option<(String, std::time::Instant)>,
+    /// 上一次查询用的（筛选, 搜索词）和结果。egui 是立即模式，`ui_list`
+    /// 每帧都会调用，没有这层缓存就会 60fps 无脑全量扫描。
+    cached_key: Option<(KindFilter, String)>,
+    cached_results: Vec<EntryMeta>,
+    /// 搜索结果里「长文本命中上下文」：id → 切出来的片段。只在搜索时非空，
+    /// 随 `cached_results` 一起重算。列表渲染只读它，不再单独查库。
+    snippets: HashMap<i64, String>,
+    /// 当前选中的条目。单击只改这个，双击/Enter 才真正动作。
+    selected: Option<i64>,
+    /// 上一次搜索词。用来检测「搜索词是否变了」，变了就清掉选中项。
+    search_snapshot: String,
+    /// 下一帧要把选中项滚进可视区。只在键盘移动选中时置位——
+    /// 否则用户用滚轮翻看时会被一直拽回选中项。
+    scroll_to_selected: bool,
+    /// 上一帧窗口是否有焦点。用来检测「刚刚失焦」这一刻。
+    was_focused: bool,
+    /// 「清空历史」的一次确认。点第一次记时间，3 秒内再点才真的清。
+    /// 清空是不可撤销的，不能一次点击就执行。
+    confirm_clear: Option<std::time::Instant>,
+    /// 文件类型条目的路径检查结果：id → 已经不存在的路径条数，0 表示全在。
+    ///
+    /// 只在新条目出现时增量检查，避免每帧对磁盘做 stat；双击粘贴时会
+    /// 实时复查并覆盖这里的值，所以文件被恢复后也能立刻纠正。
+    missing_paths: HashMap<i64, usize>,
+    /// 图片条目的缩略图缓存。解码在独立线程，这里只管取和显示。
+    thumbs: Thumbs,
+    /// 大图预览浮层里正在显示的条目 id，`None` 表示没开。
+    ///
+    /// 存 id 而不是 bool：浮层要能独立于选中项存在（选中项一删就变），
+    /// 也方便判断「当前这张解码到哪一步了」。
+    preview_id: Option<i64>,
+    /// 全文浮层的内容缓存。浮层每帧都要画这段文字，不能每帧去库里读一遍
+    /// payload（大条目还可能是一次 blob 文件读）。
+    text_view: Option<TextView>,
+}
+
+/// 全文浮层要显示的那一段。
+///
+/// 长文本不可能整段丢给 `LayoutJob`（单条内容上限 64MB），所以这里只留窗口
+/// 内的一段；有搜索词时窗口从命中处往前退一点开始，打开就能看见命中的词。
+struct TextView {
+    id: i64,
+    /// 生成这一段时用的搜索词。搜索词变了窗口要重算，否则「跳到命中处」会失效。
+    query: String,
+    text: String,
+    /// 第一个命中在 `text` 里的字节偏移。
+    hit: Option<usize>,
+    /// 前面还有内容（已经切成窗口了）。
+    skipped: bool,
+    /// 后面还有内容（超出窗口上限）。
+    truncated: bool,
+    /// 下一帧要不要把命中处滚进视野。只在刚打开/搜索词刚变时为真——
+    /// 之后每帧都滚的话，用户自己翻页会被一直拽回去。
+    scroll_to_hit: bool,
+}
+
+impl App {
+    pub fn new(
+        ctx: &egui::Context,
+        read: ReadStore,
+        tx: crossbeam_channel::Sender<Command>,
+        notify: crossbeam_channel::Receiver<()>,
+    ) -> Self {
+        let mut app = Self {
+            read,
+            tx,
+            notify,
+            index: Index::new(),
+            entries: Vec::new(),
+            search: String::new(),
+            filter: KindFilter::All,
+            counts: Counts::default(),
+            dirty: true,
+            toast: None,
+            cached_key: None,
+            cached_results: Vec::new(),
+            snippets: HashMap::new(),
+            selected: None,
+            search_snapshot: String::new(),
+            scroll_to_selected: false,
+            was_focused: false,
+            confirm_clear: None,
+            missing_paths: HashMap::new(),
+            thumbs: Thumbs::new(ctx),
+            preview_id: None,
+            text_view: None,
+        };
+        app.refresh();
+        app
+    }
+
+    /// 装入中文字体，否则中文全是豆腐块。
+    ///
+    /// 用的是 `tools/subset_font.py` 裁剪出来的子集（GB2312 全集 + ASCII + 常用标点，
+    /// 2MB 而不是系统字体的 9.7MB），并直接 `include_bytes!` 编进二进制：
+    /// - 单文件分发，不依赖目标机器装了什么字体
+    /// - `from_static` 引用只读段，不像 `from_owned` 那样在堆上再复制一份
+    ///
+    /// egui 自带字体不含 CJK，必须追加到字体族末尾做回落。
+    pub fn install_cjk_font(ctx: &egui::Context) {
+        // 调试用：设 RPASTE_NO_FONT=1 可跳过字体加载，用来量化字体占了多少常驻内存。
+        if std::env::var_os("RPASTE_NO_FONT").is_some() {
+            return;
+        }
+
+        const BUNDLED_FONT: &[u8] = include_bytes!("../assets/font.ttf");
+
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            egui::FontData::from_static(BUNDLED_FONT).into(),
+        );
+
+        // 追加到两个族族的末尾：英文仍用 egui 自带字体（更紧凑），
+        // 缺字时才回落到中文字体。
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("cjk".to_owned());
+        }
+
+        ctx.set_fonts(fonts);
+    }
+
+    fn refresh(&mut self) {
+        let Ok(total) = self.read.total() else {
+            return;
+        };
+
+        // 增量同步：新条目（id 更大）+ 最近窗口的字段刷新。
+        // 去重命中（bump）会改 created_at，靠 recent() 那 200 条覆盖过来——
+        // 被 bump 的条目一定是最新的，必然落在这个窗口里。
+        // 两批合成一次合并：`merge` 内部按 id 去重，排序只做一次。
+        let since = self.index.max_id();
+        let mut fresh = self.read.meta_since(since).unwrap_or_default();
+        fresh.extend(self.read.recent(RECENT_LIMIT).unwrap_or_default());
+        // 正文尾部只跟着**新条目**走：`recent()` 那批老条目的尾部早在索引里，
+        // 每次刷新重发一遍就是白读几十 KB。
+        let tails = self.read.tails_since(since).unwrap_or_default();
+        self.index.merge(&fresh, &tails);
+
+        // 「删一条 + 加一条」时条数刚好对得上，增量同步看不出来；
+        // 条数一旦不符就全量重建——这是索引和库之间唯一的正确性兜底。
+        if self.index.len() as i64 != total
+            && let Ok(all) = self.read.all_meta()
+        {
+            let tails = self.read.all_tails().unwrap_or_default();
+            self.index.rebuild(all, &tails);
+        }
+
+        self.entries = self.index.list(RECENT_LIMIT);
+        self.counts = self.index.counts();
+        self.dirty = false;
+        // 库里的数据变了，搜索结果也得重算，否则搜着搜着新复制的内容不出现。
+        self.cached_key = None;
+        self.refresh_missing_paths();
+    }
+
+    /// 增量刷新「源文件已不存在」标记。
+    ///
+    /// 只查本次新出现的条目，已经算过的沿用旧结果；条目被删掉时把缓存一并清掉。
+    /// `refresh()` 只在数据变化时调用，不会每帧扫磁盘。
+    fn refresh_missing_paths(&mut self) {
+        let live: HashSet<i64> = self.entries.iter().map(|e| e.id).collect();
+        self.missing_paths.retain(|id, _| live.contains(id));
+
+        for entry in &self.entries {
+            if entry.kind != Kind::Files || self.missing_paths.contains_key(&entry.id) {
+                continue;
+            }
+            let Ok(Some(payload)) = self.read.load_payload(entry.id) else {
+                continue;
+            };
+            let missing = count_missing_paths(&payload);
+            self.missing_paths.insert(entry.id, missing);
+        }
+    }
+
+    /// 每帧先消费 worker 的更新提示，有就重查。
+    fn poll_notify(&mut self) {
+        while self.notify.try_recv().is_ok() {
+            self.dirty = true;
+        }
+        if self.dirty {
+            self.refresh();
+        }
+    }
+
+    /// 把一条历史发回 worker。`paste` 为真时写完后自动 Ctrl+V 到原窗口。
+    fn send_copy(&mut self, entry: &EntryMeta, paste: bool) -> bool {
+        let Ok(Some(payload)) = self.read.load_payload(entry.id) else {
+            return false;
+        };
+
+        // 文件类型在写回前实时复查一次：源文件可能已经被删掉或移走，
+        // 再写回去就是个悬空引用，资源管理器只会静默失败、什么都不提示。
+        // 这里拦下本次粘贴并弹提示；窗口不隐藏，用户才看得见为什么没反应。
+        if entry.kind == Kind::Files {
+            let missing = count_missing_paths(&payload);
+            self.missing_paths.insert(entry.id, missing);
+            if missing > 0 {
+                self.show_toast(format!(
+                    "源文件已不存在（{missing} 个），无法粘贴：{}",
+                    entry.preview
+                ));
+                return false;
+            }
+        }
+
+        // 文本写回剪贴板时换成 CRLF，记事本 / Office 更认。
+        // 图片和文件的 payload 是二进制，原样传。
+        let payload = match entry.kind {
+            Kind::Text | Kind::RichText => {
+                denormalize_newlines(&String::from_utf8_lossy(&payload)).into_bytes()
+            }
+            _ => payload,
+        };
+
+        let req = CopyRequest {
+            kind: entry.kind,
+            payload,
+            paste,
+        };
+
+        if self.tx.send(Command::Copy(req)).is_ok() {
+            let verb = if paste { "已粘贴" } else { "已复制" };
+            self.show_toast(format!("{verb} #{}", entry.id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 单击：只选中，不动剪贴板也不收窗口。用户还需要看得见自己选了哪条。
+    fn on_single_click(&mut self, entry: &EntryMeta) {
+        self.selected = Some(entry.id);
+    }
+
+    /// 双击（或选中后按 Enter）：复制并直接粘贴到原来的窗口。
+    /// **不在这里隐藏窗口**——hide 由 worker 在把焦点还回去之后执行，
+    /// 顺序见 `win::paste_to_previous`。
+    fn on_activate(&mut self, entry: &EntryMeta) {
+        self.selected = Some(entry.id);
+        self.send_copy(entry, true);
+    }
+
+    /// 删除选中项。
+    ///
+    /// 命令发给 worker 走写连接，本地同时把这条摘掉——两边的数据源不同
+    /// （UI 持只读连接），不先摘的话要等 worker 回来才看得到变化。
+    fn delete_selected(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+
+        // 位置要在**当前可见列表**上算，不是全量 `entries`：筛了类型或搜了词时
+        // 两者顺序完全不同，用全量列表定位会把选中项跳到看不见的地方。
+        let list = self.filtered();
+        let Some(pos) = list.iter().position(|e| e.id == id) else {
+            return;
+        };
+        let preview: String = list[pos].preview.chars().take(24).collect();
+
+        if self.tx.send(Command::Delete(id)).is_err() {
+            return;
+        }
+
+        self.index.remove(id);
+        self.entries.retain(|e| e.id != id);
+        self.cached_results.retain(|e| e.id != id);
+        self.snippets.remove(&id);
+        self.counts = self.index.counts();
+
+        // 选中原位置的下一条；删的正好是最后一条就退到新的末尾。
+        let remaining: Vec<i64> = list.iter().filter(|e| e.id != id).map(|e| e.id).collect();
+        self.selected = remaining.get(pos).or_else(|| remaining.last()).copied();
+        self.scroll_to_selected = true;
+
+        // 把删掉的是什么写出来——删除不可撤销，至少让用户确认删对了。
+        self.show_toast(format!("已删除：{preview}"));
+    }
+
+    /// 切换收藏。收藏项不会被 1 万条的容量规则淘汰。
+    fn toggle_pin_selected(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(pinned) = self.entries.iter().find(|e| e.id == id).map(|e| !e.pinned) else {
+            return;
+        };
+
+        if self.tx.send(Command::SetPinned(id, pinned)).is_err() {
+            return;
+        }
+
+        self.index.set_pinned(id, pinned);
+        // 收藏会改变排序（置顶），列表必须从索引重新取一份。只改 `pinned`
+        // 字段的话条目还蹲在原位置，和「收藏 = 钉在顶部」的直觉对不上。
+        self.entries = self.index.list(RECENT_LIMIT);
+        self.cached_key = None;
+        self.selected = Some(id);
+        self.scroll_to_selected = true;
+
+        self.show_toast(if pinned {
+            "已收藏（置顶，且不会被自动清理）".to_owned()
+        } else {
+            "已取消收藏".to_owned()
+        });
+    }
+
+    /// 窗口失焦就收起；重新获得焦点时把键盘焦点交给搜索框。
+    ///
+    /// 只在「从有焦点变成没焦点」的那一刻动作：窗口刚唤出时焦点可能还没到，
+    /// 那种 `focused == false` 不能当成用户点了外面。
+    ///
+    /// 焦点一进来就 request_focus 到搜索框，这样唤出后直接打字就是搜索，
+    /// 不用先用鼠标点一下输入框。
+    fn tick_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+
+        if self.was_focused && !focused {
+            win::hide_main_window();
+        } else if !self.was_focused && focused {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
+        }
+
+        self.was_focused = focused;
+    }
+
+    /// 搜索词一变就丢掉选中项。
+    ///
+    /// 两个理由：
+    /// 1. 之前选中的那行可能已经不在新结果里了，`selected` 指向一条看不见的记录。
+    /// 2. `Delete` 的语义是「删选中的那条」。用户正在改搜索词时按 Delete
+    ///    显然是想删字符，不该有一把「看不见的刀」挂在选中项上。
+    fn sync_search_state(&mut self) {
+        if self.search != self.search_snapshot {
+            self.search_snapshot = self.search.clone();
+            self.selected = None;
+        }
+    }
+
+    /// 键盘操作。
+    ///
+    /// 这些键必须用 `consume_key` 从事件队列里**摘掉**：搜索框有焦点时，
+    /// egui 的 TextEdit 会先消费 Enter（表现为失焦），方向键也会被挪光标。
+    /// 只在 `update` 开头拦，才轮得到我们处理。
+    ///
+    /// 方向键要**循环消费**：一帧里可能攒了好几个按键事件（按住不放的自动重复，
+    /// 或者处理慢时的补帧），而 `consume_key` 一次只摘掉一个。
+    /// 不循环的话，快按几下只会动一格，手感很粘。
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Esc 是分层退出：浮层开着先关浮层，再按一次才收窗口。
+        // 直接收窗口的话，用户想退掉大图就整个界面没了，得重新按一次热键。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if self.preview_id.is_some() {
+                self.preview_id = None;
+                self.text_view = None;
+            } else {
+                win::hide_main_window();
+            }
+            return;
+        }
+
+        // Alt+1..9：直接粘贴当前列表的第 N 条。
+        //
+        // 比「↓ 定位再 Enter」少一半按键，翻前几条时这是最快的路径。
+        // 顺序按**当前可见列表**算，所以搜索和筛选之后按的仍然是眼前第 N 条。
+        for (i, key) in QUICK_PASTE_KEYS.iter().enumerate() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, *key)) {
+                // Alt+数字在 Windows 上会同时产生一个 `Event::Text("2")`，
+                // 而 `consume_key` 只摘 `Event::Key`——不删掉文本事件的话，
+                // 键是"吞"了，数字照样落到搜索框里，把列表筛成只剩含 "2" 的条目。
+                drop_text(ctx, &char::from(b'1' + i as u8).to_string());
+                match self.filtered().get(i).cloned() {
+                    Some(entry) => self.on_activate(&entry),
+                    // 按了超出列表长度的数字：给一句话，否则看起来像没反应。
+                    None => self.show_toast(format!("当前列表没有第 {} 条", i + 1)),
+                }
+                return;
+            }
+        }
+
+        // Delete 删选中项。
+        //
+        // **只在有选中项时才碰这个键**：没有选中项说明用户在编辑搜索词，
+        // Delete 该归输入框，这时候吃掉事件会让「删字符」失灵。
+        //
+        // 有选中项时则一定删——用户按 ↓ 或点了某一行，预期就是「删这一条」。
+        // 搜索词一变会清空选中项（见 `sync_search_state`），所以「正在改搜索词
+        // 却把历史删掉」的路径被堵住了。
+        if self.selected.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+        {
+            self.delete_selected();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::P)) {
+            self.toggle_pin_selected();
+        }
+
+        // 类型筛选：Ctrl+1/2/3 只看文本 / 图片 / 文件，Ctrl+0 回到全部。
+        for (key, filter) in [
+            (egui::Key::Num1, KindFilter::Text),
+            (egui::Key::Num2, KindFilter::Image),
+            (egui::Key::Num3, KindFilter::Files),
+            (egui::Key::Num0, KindFilter::All),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, key)) {
+                self.set_filter(filter);
+            }
+        }
+
+        // 空格开关预览浮层（图片看大图，文本看全文）。
+        //
+        // 这个键和输入框有冲突，所以**先判断该不该抢，再消费事件**：
+        // `consume_key` 一旦调用，事件就从队列里没了，条件不满足时再后悔
+        // 已经晚了——用户按空格想打「空格」会变成什么也没发生。
+        //
+        // 抢的两种情形：浮层开着（空格 = 关掉）；搜索词为空且有选中项
+        // （空搜索框里打空格毫无意义，正好让给预览）。搜索词非空时一律让给
+        // 输入框，否则多词搜索连分隔符都打不出来。
+        let want_space =
+            self.preview_id.is_some() || (self.search.trim().is_empty() && self.selected.is_some());
+        if want_space && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            // 同上：输入框吃的是 `Event::Text`，不把那个空格一起滤掉的话，
+            // 搜索词会被改动，进而触发 `sync_search_state` 清空选中项——
+            // 表现成"按空格预览失败，顺带把选中项也弄丢了"。
+            drop_text(ctx, " ");
+            self.preview_id = if self.preview_id.is_some() {
+                None
+            } else {
+                self.selected
+            };
+            return;
+        }
+
+        // Alt+Enter：打开/关闭预览浮层，**搜索词非空时也能用**。
+        //
+        // 空格是更顺手的那个，但它必须让给「在搜索词里打空格」，所以再留一个
+        // 不受搜索状态影响的入口。搜出一条长文本、想读全文的时候正是需要它
+        // 的时候——而那一刻搜索框里通常正有词。
+        if self.selected.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter))
+        {
+            self.preview_id = if self.preview_id.is_some() {
+                None
+            } else {
+                self.selected
+            };
+            return;
+        }
+
+        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+
+        let ups = drain_keys(ctx, egui::Key::ArrowUp);
+        let downs = drain_keys(ctx, egui::Key::ArrowDown);
+
+        if ups == 0 && downs == 0 && !enter {
+            return;
+        }
+
+        let list = self.filtered();
+        if list.is_empty() {
+            return;
+        }
+
+        for _ in 0..ups {
+            self.step_selection(&list, -1);
+        }
+        for _ in 0..downs {
+            self.step_selection(&list, 1);
+        }
+
+        if enter {
+            // 没选中就直接拿第一条——`Alt+V` 后一路 Enter 是最顺手的路径。
+            let target = match self.selected {
+                Some(id) if list.iter().any(|e| e.id == id) => {
+                    list.iter().find(|e| e.id == id).cloned()
+                }
+                _ => list.first().cloned(),
+            };
+            if let Some(entry) = target {
+                self.on_activate(&entry);
+            }
+        }
+    }
+
+    /// 上下键移动选中项。到头就停住，不循环——循环会让「按到底」失去确定感。
+    fn step_selection(&mut self, list: &[EntryMeta], delta: isize) {
+        let cur = self
+            .selected
+            .and_then(|id| list.iter().position(|e| e.id == id));
+
+        let next = match cur {
+            Some(i) => (i as isize + delta).clamp(0, list.len() as isize - 1) as usize,
+            // 还没选过：向下选第一条，向上选最后一条
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    list.len() - 1
+                }
+            }
+        };
+
+        self.selected = Some(list[next].id);
+        // 让列表跟着滚。不置位的话，选中项移出可视区后按方向键
+        // 会出现「选中了但看不见选中了什么」。
+        self.scroll_to_selected = true;
+    }
+
+    fn show_toast(&mut self, msg: String) {
+        self.toast = Some((msg, std::time::Instant::now()));
+    }
+
+    /// 取当前要显示的列表。筛选条件和搜索词都没变就复用上次结果，
+    /// 避免每帧重新扫一遍索引。
+    fn filtered(&mut self) -> Vec<EntryMeta> {
+        let key = (self.filter, self.search.trim().to_owned());
+        if self.cached_key.as_ref() == Some(&key) {
+            return self.cached_results.clone();
+        }
+
+        let results = self.index.query(&key.1, key.0, RECENT_LIMIT);
+
+        // 命中上下文和结果一起算：两者都是「查询变了才要重算」的东西，
+        // 分开维护只会多一处忘记同步的地方。
+        let ids: HashSet<i64> = results.iter().map(|e| e.id).collect();
+        let terms: Vec<&str> = key.1.split_whitespace().collect();
+        let snippets = self.index.snippets(&ids, &terms, SNIPPET_CHARS);
+
+        self.cached_key = Some(key);
+        self.cached_results = results.clone();
+        self.snippets = snippets;
+        results
+    }
+
+    /// 切类型筛选。再点一次当前档位等于取消筛选（回到「全部」）。
+    fn set_filter(&mut self, filter: KindFilter) {
+        self.filter = if self.filter == filter {
+            KindFilter::All
+        } else {
+            filter
+        };
+        self.cached_key = None;
+        // 之前选中的那条可能已经不在新列表里，留着会变成一把「看不见的刀」
+        // ——`Delete` 会删掉一条用户根本看不见的记录。
+        self.selected = None;
+        self.scroll_to_selected = false;
+    }
+
+    fn ui_header(&mut self, ui: &mut egui::Ui) {
+        // 搜索框自己就是标题：这个窗口只有一个用途，挂个 "R-Paste" 只是白占
+        // 一行高度（顶栏每多一行，列表就少一行）。
+        let show_clear = !self.search.is_empty();
+
+        // 清除键画在输入框**里面**，而不是旁边再摆一个按钮。
+        // 好处是顶栏只有一行，且宽度不用手算：`TextEdit` 的右内边距就是给
+        // 它挖的坑，输入框照旧 `INFINITY` 填满整行。
+        const CLEAR_W: i8 = 20;
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .id(egui::Id::new("search"))
+                .hint_text("搜索历史…（空格分词，wj = 文件）")
+                .margin(egui::Margin {
+                    left: 4,
+                    right: if show_clear { CLEAR_W + 2 } else { 4 },
+                    top: 2,
+                    bottom: 2,
+                })
+                .desired_width(f32::INFINITY),
+        );
+
+        // 搜索框为空时没有东西可清，按钮和它占的位置一起省掉。
+        if show_clear {
+            // 用 painter 自己画，而不是 `ui.put(Button)`：后者要走一遍 allocate，
+            // 在这一行里再挤出一个控件位置，把输入框填满整行的效果破坏掉。
+            let side = CLEAR_W as f32;
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(edit.rect.right() - 2.0 - side / 2.0, edit.rect.center().y),
+                egui::vec2(side, side),
+            );
+            let resp = ui
+                .interact(rect, egui::Id::new("search-clear"), egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+            let visuals = ui.visuals();
+            if resp.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+            }
+            // 叉号自己画两条线，不用字符：egui 默认字体里没有 ✕ (U+2715)，
+            // 直接写会渲染成豆腐块。画线还顺手解决了「不同字号下粗细不一」。
+            let color = if resp.hovered() {
+                visuals.strong_text_color()
+            } else {
+                visuals.weak_text_color()
+            };
+            let c = rect.center();
+            let d = 4.0;
+            let stroke = egui::Stroke::new(1.4, color);
+            ui.painter()
+                .line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
+            ui.painter()
+                .line_segment([c + egui::vec2(d, -d), c + egui::vec2(-d, d)], stroke);
+
+            if resp.clicked() {
+                self.search.clear();
+                // 清空之后最常见的动作是接着打字，焦点还给输入框。
+                edit.request_focus();
+            }
+        }
+
+        // 类型筛选 chip。计数直接标在标签上——「图片 3」比只看「图片」信息量大，
+        // 也让用户一眼知道切过去是不是空的。
+        ui.add_space(5.0);
+        let counts = self.counts;
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if let Some(f) = filter_chips(ui, self.filter, counts) {
+                picked = Some(f);
+            }
+        });
+        if let Some(f) = picked {
+            self.set_filter(f);
+        }
+        ui.separator();
+    }
+
+    fn ui_list(&mut self, ui: &mut egui::Ui) {
+        let entries = self.filtered();
+        let searching = !self.search.trim().is_empty();
+        // 预览浮层盖住列表时不响应点击——否则点在图上会把下面那行也一起选中，
+        // 甚至触发粘贴。列表照常绘制，只是不再接收交互。
+        let locked = self.preview_id.is_some();
+        // 搜索词拆一次给整轮渲染用；来源是 `self.search`，得先脱开借用，
+        // 循环里还要 &mut self 处理点击和缩略图。
+        let terms: Vec<String> = if searching {
+            self.search.split_whitespace().map(str::to_owned).collect()
+        } else {
+            Vec::new()
+        };
+        let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        // 先取快照：渲染过程中不能一边读一边清，否则后面的条目判断就乱了。
+        let scroll_to_selected = self.scroll_to_selected;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        let hint = if searching {
+                            "没有匹配的记录"
+                        } else if self.filter == KindFilter::All {
+                            "还没有剪贴板历史，复制点东西试试。"
+                        } else {
+                            "这个类型还没有记录"
+                        };
+                        ui.label(hint);
+                    });
+                    return;
+                }
+
+                for entry in &entries {
+                    let created = fmt_time(entry.created_at);
+                    let is_selected = self.selected == Some(entry.id);
+                    let missing = self.missing_paths.get(&entry.id).copied().unwrap_or(0);
+
+                    // 这一行是否落在可视区。缩略图排队靠它：解码很贵，
+                    // 200 条历史一次性灌满解码队列会让翻页全在等它。
+                    let probe = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        egui::vec2(ui.available_width(), THUMB_H),
+                    );
+                    let visible = ui.is_rect_visible(probe);
+
+                    // 搜索时优先显示命中上下文：长文本只画开头的话，
+                    // 命中的词常常在 5000 字之后，看到的是一条完全不含
+                    // 搜索词的内容——直觉就是「搜索没生效」。
+                    let shown_src = self
+                        .snippets
+                        .get(&entry.id)
+                        .map(String::as_str)
+                        .unwrap_or(entry.preview.as_str());
+                    let shown = truncate_chars(shown_src, PREVIEW_SHOW_CHARS);
+                    let ranges = if term_refs.is_empty() {
+                        Vec::new()
+                    } else {
+                        match_ranges(&shown, &term_refs)
+                    };
+
+                    // 图片条目：缩略图还没解好就先画占位块。
+                    //
+                    // 只有真正落在可视区里的行才排队解码——否则一打开列表，
+                    // 200 条历史里的图片会一次性灌满解码队列，翻页全在等它。
+                    let thumb = if entry.kind == Kind::Image && visible {
+                        self.thumbs
+                            .get(ui.ctx(), &self.read, entry.id, entry.byte_len)
+                    } else {
+                        None
+                    };
+
+                    // 半透明高亮：深浅主题都透出底色，不会把文字盖住。
+                    let sel = ui.visuals().selection.bg_fill;
+                    let bg = if is_selected {
+                        Some(egui::Color32::from_rgba_unmultiplied(
+                            sel.r(),
+                            sel.g(),
+                            sel.b(),
+                            58,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let mut frame = egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: 8,
+                            right: 8,
+                            top: 5,
+                            bottom: 5,
+                        })
+                        .corner_radius(5.0);
+                    if let Some(bg) = bg {
+                        frame = frame.fill(bg);
+                    }
+
+                    // 卡片正文：元数据行 + 预览行。图片条目多一个左侧缩略图，
+                    // 正文逻辑完全共用，不复制一份。
+                    let body = |ui: &mut egui::Ui| {
+                        ui.horizontal(|ui| {
+                            if entry.pinned {
+                                ui.label(
+                                    egui::RichText::new("★")
+                                        .color(egui::Color32::from_rgb(228, 172, 45))
+                                        .size(12.0),
+                                );
+                            }
+                            kind_chip(ui, entry.kind);
+                            if missing > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("源文件已失效 ({missing})"))
+                                        .color(egui::Color32::from_rgb(0xE2, 0x4B, 0x4A))
+                                        .small(),
+                                );
+                            }
+                            // 文本类显示字节数没有信息量，只在图片 / 文件类给体积。
+                            if !matches!(entry.kind, Kind::Text | Kind::RichText) {
+                                ui.label(
+                                    egui::RichText::new(human_size(entry.byte_len))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                            if entry.hit_count > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("×{}", entry.hit_count))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(egui::RichText::new(created).weak().small());
+                                },
+                            );
+                        });
+                        ui.label(preview_job(ui, &shown, &ranges, missing > 0));
+                    };
+
+                    let resp = frame
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if entry.kind == Kind::Image {
+                                ui.horizontal(|ui| {
+                                    match &thumb {
+                                        Some(t) => thumb_image(ui, t),
+                                        None => thumb_placeholder(ui),
+                                    }
+                                    ui.add_space(6.0);
+                                    let width = ui.available_width();
+                                    ui.vertical(|ui| {
+                                        ui.set_width(width);
+                                        body(ui);
+                                    });
+                                });
+                            } else {
+                                body(ui);
+                            }
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+
+                    if !locked {
+                        if resp.double_clicked() {
+                            self.on_activate(entry);
+                        } else if resp.clicked() {
+                            self.on_single_click(entry);
+                        }
+                    }
+
+                    // 键盘移动选中项时把它带到视野中间。
+                    //
+                    // 必须显式传 `ScrollAnimation::none()`：默认的平滑滚动要靠
+                    // 连续重绘推进动画，而这个窗口空闲时根本不重绘（省 CPU），
+                    // 动画会卡在第一帧，表现得像「scroll_to 完全没生效」。
+                    if scroll_to_selected && is_selected {
+                        ui.scroll_to_rect_animation(
+                            resp.rect,
+                            Some(egui::Align::Center),
+                            egui::style::ScrollAnimation::none(),
+                        );
+                    }
+
+                    if resp.hovered() && !locked {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                    }
+
+                    // 选中项左侧一条强调竖条：浅色主题下光靠底色几乎看不出来。
+                    if is_selected {
+                        let bar = egui::Rect::from_min_size(
+                            resp.rect.left_top() + egui::vec2(2.0, 4.0),
+                            egui::vec2(3.0, (resp.rect.height() - 8.0).max(0.0)),
+                        );
+                        ui.painter().rect_filled(bar, 1.5, sel);
+                    } else {
+                        // 卡片之间一条极淡的分隔线，替代原来散乱的空白。
+                        let y = resp.rect.bottom() + 2.0;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(resp.rect.left() + 8.0, y),
+                                egui::pos2(resp.rect.right() - 8.0, y),
+                            ],
+                            ui.visuals().widgets.noninteractive.bg_stroke,
+                        );
+                    }
+                    ui.add_space(5.0);
+                }
+            });
+
+        // 本帧已经处理过滚动请求，清掉，避免之后每帧都把视图拽回选中项
+        if scroll_to_selected {
+            self.scroll_to_selected = false;
+        }
+    }
+
+    /// 预览浮层：图片看大图，文本看全文。
+    ///
+    /// 盖在同一个窗口里而不是新开一个窗口：主窗口是置顶无边框小窗，
+    /// 再开一个窗口就要处理「关掉一个另一个留在哪一层」的焦点问题，
+    /// 而预览本来就是看一眼就走的东西，不值得引入第二套窗口生命周期。
+    ///
+    /// 配合 `ui_list` 里的 `locked`，预览期间下面的行既不响应点击也不显示手形光标。
+    fn ui_preview(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.preview_id else {
+            return;
+        };
+        // 条目可能在浮层开着的时候被删掉（Delete 走的是别处），取不到就收起。
+        let Some(entry) = self.index.get(id).cloned() else {
+            self.preview_id = None;
+            return;
+        };
+
+        // 文本类走全文浮层。列表里那条预览只存了前 512 字（长文本连两行都
+        // 显示不满），想看全只能在这里——不然「复制过的东西看不到全貌」。
+        if matches!(entry.kind, Kind::Text | Kind::RichText) {
+            if self.ui_text_view(ui, &entry) {
+                self.preview_id = None;
+                self.text_view = None;
+            }
+            return;
+        }
+
+        // 解码请求每帧都要问一次，否则纹理解出来了也没人来取。
+        let state = self
+            .thumbs
+            .preview(ui.ctx(), &self.read, entry.id, entry.byte_len);
+
+        // 用 Area 而不是面板的 painter：面板画布被裁在 CentralPanel 里，
+        // 盖不住顶部的搜索框和底部的状态栏，露出来的浅色边会一直分散注意力。
+        // 独立 Area 在 Foreground 层，能铺满整个窗口，也天然接管点击。
+        let screen = ui.ctx().content_rect();
+        let avail = screen.shrink(12.0);
+        let mut close = false;
+
+        egui::Area::new(egui::Id::new("preview"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ui.ctx(), |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                if resp.clicked() {
+                    close = true;
+                }
+
+                // 压到接近全黑：列表还亮着的话，看图时文字和分隔线会一直往眼里钻。
+                let painter = ui.painter();
+                painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(244));
+
+                match &state {
+                    PreviewState::Ready(thumb) => {
+                        let size = fit_preview(thumb.source, avail.size());
+                        let img = egui::Rect::from_center_size(avail.center(), size);
+                        painter.image(
+                            thumb.texture.id(),
+                            img,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                        // 尺寸信息放左下角：看图时最常问的就是「这图多大」。
+                        painter.text(
+                            screen.left_bottom() + egui::vec2(10.0, -8.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!(
+                                "{}×{} · 空格 / Esc / 点击关闭",
+                                thumb.source.x as i32, thumb.source.y as i32
+                            ),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_gray(150),
+                        );
+                    }
+                    PreviewState::Loading => {
+                        painter.text(
+                            screen.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "解码中…",
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::from_gray(180),
+                        );
+                    }
+                    PreviewState::Failed => {
+                        painter.text(
+                            screen.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "这张图无法预览（数据损坏或尺寸过大）",
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::from_gray(180),
+                        );
+                    }
+                }
+            });
+
+        if close {
+            self.preview_id = None;
+        }
+    }
+
+    /// 文本条目的全文浮层。返回 `true` 表示用户要求关闭。
+    ///
+    /// 为什么不把全文直接铺在列表里：512 字的预览折行后已经能吃掉大半个窗口，
+    /// 八千字的正文会把列表冲得找不着北。列表负责「扫」，浮层负责「读」。
+    fn ui_text_view(&mut self, ui: &mut egui::Ui, entry: &EntryMeta) -> bool {
+        // 浮层里的高亮沿用列表那套：同一个搜索词，在任何地方都应该被标出来。
+        let query = self.search.trim().to_owned();
+        let terms: Vec<&str> = query.split_whitespace().collect();
+
+        // 内容只从库里读一次。浮层开着时每帧重读一遍 payload 是纯粹的 IO 浪费，
+        // 大条目还可能是一次 blob 文件读。
+        let stale = self
+            .text_view
+            .as_ref()
+            .is_none_or(|v| v.id != entry.id || v.query != query);
+        if stale {
+            let raw = self
+                .read
+                .load_payload(entry.id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&raw);
+            let (shown, hit, skipped, truncated) = text_view_window(&text, &terms, TEXT_VIEW_CHARS);
+            self.text_view = Some(TextView {
+                id: entry.id,
+                query: query.clone(),
+                text: shown,
+                hit,
+                skipped,
+                truncated,
+                scroll_to_hit: true,
+            });
+        }
+        let view = self.text_view.as_ref().expect("上面刚填过");
+
+        let ranges = match_ranges(&view.text, &terms);
+        let scroll_to_hit = view.scroll_to_hit && view.hit.is_some();
+
+        let screen = ui.ctx().content_rect();
+        let mut close = false;
+
+        egui::Area::new(egui::Id::new("text-view"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ui.ctx(), |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                // 点空白处收起。点击落在下面的面板/滚动区上时由它们接管，
+                // 所以不会「刚一拖动滚动条就关掉」。
+                if resp.clicked() {
+                    close = true;
+                }
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(210));
+
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(screen.shrink(10.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+
+                egui::Frame::new()
+                    .fill(ui.visuals().window_fill)
+                    .stroke(ui.visuals().window_stroke)
+                    .corner_radius(8.0)
+                    .inner_margin(10.0)
+                    .show(&mut child, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            kind_chip(ui, entry.kind);
+                            if view.skipped {
+                                ui.label(egui::RichText::new("已从命中处开始").weak().small());
+                            }
+                            if view.truncated {
+                                ui.label(egui::RichText::new("只显示前 32K 字").weak().small());
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · 空格 / Esc 关闭",
+                                            human_size(entry.byte_len)
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                },
+                            );
+                        });
+                        ui.separator();
+
+                        // 剩余高度全给正文，滚动条只在这一块里生效。
+                        // `auto_shrink` 纵向为真：短内容把卡片收到它自己的高度，
+                        // 一条 85 字节的文本不该占满整屏。
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                // 自己排版再交给 painter：`scroll_to_rect` 要的是
+                                // 「命中那一行在哪」，而这个位置只有 galley 知道。
+                                // 走 `Fonts::layout_job` 和 Label 用的是同一份
+                                // galley 缓存，不会重复排版。
+                                let job = full_text_job(ui, &view.text, &ranges);
+                                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                let (rect, _) =
+                                    ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+                                ui.painter().galley(
+                                    rect.min,
+                                    galley.clone(),
+                                    ui.visuals().text_color(),
+                                );
+
+                                if scroll_to_hit && let Some(pos) = view.hit {
+                                    let chars = view.text[..pos].chars().count();
+                                    let hit =
+                                        galley.pos_from_cursor(egui::text::CCursor::new(chars));
+                                    let target = egui::Rect::from_min_size(
+                                        rect.min + hit.min.to_vec2(),
+                                        egui::vec2(rect.width().max(1.0), hit.height().max(1.0)),
+                                    );
+                                    ui.scroll_to_rect(target, Some(egui::Align::Center));
+                                }
+                            });
+                    });
+            });
+
+        if scroll_to_hit && let Some(view) = self.text_view.as_mut() {
+            view.scroll_to_hit = false;
+        }
+        close
+    }
+
+    fn ui_footer(&mut self, ui: &mut egui::Ui) {
+        // 「确认清空」只在 3 秒内有效，过期自动收回，避免按钮一直挂在待确认态。
+        let confirming = self
+            .confirm_clear
+            .map(|t| t.elapsed() < CLEAR_CONFIRM_TTL)
+            .unwrap_or(false);
+
+        ui.horizontal(|ui| {
+            // 左侧：操作反馈，没有就显示快捷键提示
+            let mut expired = false;
+            match &self.toast {
+                Some((msg, t)) if t.elapsed().as_secs() < 3 => {
+                    ui.label(egui::RichText::new(msg).small());
+                    // 到期时叫醒一帧，否则空闲不重绘、提示会一直挂着不走。
+                    let left = std::time::Duration::from_secs(3) - t.elapsed();
+                    ui.ctx().request_repaint_after(left);
+                }
+                Some(_) => expired = true,
+                None => {
+                    // 选中项有预览可看时换一套提示：空格是这一刻最有用、
+                    // 也最不为人知的键，其余时候它根本不生效，一直挂着只会占地方。
+                    let kind = self
+                        .selected
+                        .and_then(|id| self.index.get(id))
+                        .map(|e| e.kind);
+                    let hint = match kind {
+                        Some(Kind::Image) => "空格看大图 · Enter 粘贴 · Alt+1~9 直达",
+                        Some(Kind::Text | Kind::RichText) => {
+                            "空格看全文 · Enter 粘贴 · Alt+1~9 直达"
+                        }
+                        _ => "↑↓ 选择 · Alt+1~9 直达 · Del 删除 · Ctrl+P 收藏",
+                    };
+                    ui.label(egui::RichText::new(hint).weak().small());
+                }
+            }
+            if expired {
+                self.toast = None;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if confirming {
+                    "确认清空？"
+                } else {
+                    "清空历史"
+                };
+                let resp = ui.button(egui::RichText::new(label).small());
+                if resp.clicked() {
+                    if confirming {
+                        self.confirm_clear = None;
+                        if self.tx.send(Command::Clear).is_ok() {
+                            // 收藏项保留，所以本地只摘掉未收藏的。
+                            self.entries.retain(|e| e.pinned);
+                            self.cached_results.retain(|e| e.pinned);
+                            self.index.retain_pinned();
+                            self.counts = self.index.counts();
+                            self.cached_key = None;
+                            self.selected = None;
+                            self.show_toast("已清空历史（收藏项保留）".to_owned());
+                        }
+                    } else {
+                        self.confirm_clear = Some(std::time::Instant::now());
+                        // 到期要把标签恢复成「清空历史」，得先安排一次重绘。
+                        ui.ctx().request_repaint_after(CLEAR_CONFIRM_TTL);
+                    }
+                }
+            });
+        });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 隐藏窗口正常不会有 RedrawRequested，但万一有也不该重建整个列表。
+        if !win::is_main_window_visible() {
+            return;
+        }
+
+        self.tick_focus(ctx);
+        self.poll_notify();
+        self.sync_search_state();
+        self.handle_keys(ctx);
+
+        // 浮层显示的是「某一条」。选中项换人或被删掉之后继续盖着，
+        // 会让人以为浮层里的图就是眼前选中的那条——直接收起。
+        if self.preview_id.is_some_and(|id| self.selected != Some(id)) {
+            self.preview_id = None;
+        }
+
+        // 点窗口关闭按钮不退出，收进托盘。先 CancelClose 阻止 eframe 销毁窗口，
+        // 再用 Win32 把它藏起来。退出走托盘菜单（由 listener 直接处理）。
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            win::hide_main_window();
+        }
+
+        egui::TopBottomPanel::top("header").show(ctx, |ui| self.ui_header(ui));
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| self.ui_footer(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.ui_list(ui);
+            self.ui_preview(ui);
+        });
+    }
+}
+
+/// 把某个字符从本帧的文本事件里摘掉。
+///
+/// `consume_key` 只删 `Event::Key`，而输入框吃的是 `Event::Text`。组合键里的
+/// 可打印键（空格、Alt+数字）同时产生两者，不删干净的话键是"吞"了，
+/// 字符照样落进搜索框——顺手把列表筛成一个莫名其妙的结果。
+fn drop_text(ctx: &egui::Context, ch: &str) {
+    ctx.input_mut(|i| {
+        i.events
+            .retain(|e| !matches!(e, egui::Event::Text(t) if t == ch));
+    });
+}
+
+/// 把某个键在这一帧积压的所有按下事件都消费掉，返回次数。
+///
+/// 上限 20 次纯粹是防御——正常一帧不可能攒这么多。
+fn drain_keys(ctx: &egui::Context, key: egui::Key) -> usize {
+    let mut n = 0;
+    while n < 20 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+        n += 1;
+    }
+    n
+}
+
+/// 顶部那一排类型筛选 chip。返回用户点中的档位（没有点击则 `None`）。
+fn filter_chips(ui: &mut egui::Ui, current: KindFilter, counts: Counts) -> Option<KindFilter> {
+    let items = [
+        (
+            "全部",
+            KindFilter::All,
+            counts.all,
+            egui::Color32::from_rgb(0x5B, 0x6B, 0x7A),
+        ),
+        (
+            "文本",
+            KindFilter::Text,
+            counts.text,
+            egui::Color32::from_rgb(0x18, 0x5F, 0xA5),
+        ),
+        (
+            "图片",
+            KindFilter::Image,
+            counts.image,
+            egui::Color32::from_rgb(0x0F, 0x6E, 0x56),
+        ),
+        (
+            "文件",
+            KindFilter::Files,
+            counts.files,
+            egui::Color32::from_rgb(0x99, 0x3C, 0x1D),
+        ),
+    ];
+
+    let mut picked = None;
+    for (label, filter, n, tint) in items {
+        if filter_chip(ui, label, n, current == filter, tint) {
+            picked = Some(filter);
+        }
+    }
+    picked
+}
+
+/// 单个筛选 chip。选中时用实色底 + 白字，一眼能看出当前在哪一档；
+/// 未选中只给一层极淡同色底，不抢列表的注意力。
+fn filter_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    n: usize,
+    active: bool,
+    tint: egui::Color32,
+) -> bool {
+    let (fill, color, stroke) = if active {
+        (
+            egui::Color32::from_rgb(0x2C, 0x5E, 0x8A),
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        )
+    } else if n == 0 {
+        // 没内容的档位弱化，但仍可点——点了能看到「这个类型还没有记录」。
+        (
+            egui::Color32::TRANSPARENT,
+            ui.visuals().weak_text_color(),
+            egui::Stroke::NONE,
+        )
+    } else {
+        (
+            egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 24),
+            tint,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 60),
+            ),
+        )
+    };
+
+    let resp = egui::Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(9.0)
+        .inner_margin(egui::Margin {
+            left: 8,
+            right: 8,
+            top: 3,
+            bottom: 3,
+        })
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{label} {n}"))
+                    .small()
+                    .strong()
+                    .color(color),
+            );
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    if resp.hovered() {
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+/// 构造带命中高亮的预览文本。
+///
+/// 列表里的预览行：等宽字体、最多 `PREVIEW_ROWS` 行、超出用省略号收尾。
+///
+/// 用 `LayoutJob` 而不是给 `RichText` 加样式，有两个原因：
+/// 1. `RichText` 只能整条一个颜色，而这里要的是「同一条里只有几个词变色」；
+/// 2. `max_rows` 这个旋钮只存在于 `LayoutJob` 的 `TextWrapping` 上。
+///
+/// 代价是每帧都要算一次 job 的哈希再查 galley 缓存（命中缓存就不重排），
+/// 所以调用方会先把文本截到 `PREVIEW_SHOW_CHARS` 以内。
+fn preview_job(
+    ui: &egui::Ui,
+    text: &str,
+    ranges: &[(usize, usize)],
+    dim: bool,
+) -> egui::text::LayoutJob {
+    let mut job = text_job(ui, text, ranges, dim);
+    job.wrap.max_rows = PREVIEW_ROWS;
+    job.wrap.overflow_character = Some('…');
+    job
+}
+
+/// 全文浮层用：不限制行数，其余排版规则和列表一致。
+fn full_text_job(ui: &egui::Ui, text: &str, ranges: &[(usize, usize)]) -> egui::text::LayoutJob {
+    text_job(ui, text, ranges, false)
+}
+
+fn text_job(
+    ui: &egui::Ui,
+    text: &str,
+    ranges: &[(usize, usize)],
+    dim: bool,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+
+    let visuals = ui.visuals();
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+
+    let color = if dim {
+        visuals.weak_text_color()
+    } else {
+        visuals.text_color()
+    };
+    let base = TextFormat {
+        font_id: egui::FontId::monospace(13.0),
+        color,
+        ..Default::default()
+    };
+
+    // 命中部分只加一层半透明底色，不换字色：底色由主题决定，深浅主题都不会
+    // 出现「亮底浅字」这种对比度塌掉的情况。
+    let sel = visuals.selection.bg_fill;
+    let mut hl = base.clone();
+    hl.background = egui::Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 120);
+
+    let mut cursor = 0;
+    for &(s, e) in ranges {
+        let s = s.max(cursor);
+        if s >= e || e > text.len() {
+            continue;
+        }
+        if s > cursor {
+            job.append(&text[cursor..s], 0.0, base.clone());
+        }
+        job.append(&text[s..e], 0.0, hl.clone());
+        cursor = e;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, base);
+    }
+    job
+}
+
+/// 全文浮层要渲染的那一段：有搜索词就从命中处往前退一点开始。
+///
+/// 返回 `(片段, 前面是否还有, 后面是否还有)`。为什么要切片而不是整段渲染：
+/// 单条内容上限 64MB，整段丢进 `LayoutJob` 会把界面卡住；而且命中点可能在
+/// 几十屏之后，从头铺开等于让用户自己再找一遍。
+fn text_view_window(
+    text: &str,
+    terms: &[&str],
+    max_chars: usize,
+) -> (String, Option<usize>, bool, bool) {
+    /// 命中点前面留多少字做上下文。
+    const LEAD_CHARS: usize = 240;
+
+    let total = text.chars().count();
+    let hit = crate::search::find_hit(text, terms);
+    let mut start_byte = 0;
+    if total > max_chars
+        && let Some(pos) = hit
+    {
+        let before = text[..pos].chars().count();
+        let back = before.saturating_sub(LEAD_CHARS);
+        start_byte = char_offset(text, back);
+        // 尽量从行首开始：把一行代码或一句话切成两半很难读。
+        if let Some(nl) = text[..start_byte].rfind('\n') {
+            start_byte = nl + 1;
+        }
+    }
+
+    let shown: String = text[start_byte..].chars().take(max_chars).collect();
+    let hit_in_view = hit.and_then(|pos| pos.checked_sub(start_byte));
+    let skipped = start_byte > 0;
+    let head_chars = text[..start_byte].chars().count();
+    let truncated = total > head_chars + shown.chars().count();
+    (shown, hit_in_view, skipped, truncated)
+}
+
+/// 第 `n` 个字符所在的字节偏移；越界时返回 `s.len()`。
+fn char_offset(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// 按字符截断，超出的部分用省略号补上——「还有下文」必须让用户看得见。
+fn truncate_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    match s.char_indices().nth(max) {
+        None => std::borrow::Cow::Borrowed(s),
+        Some((idx, _)) => {
+            let mut out = String::with_capacity(idx + 3);
+            out.push_str(&s[..idx]);
+            out.push('…');
+            std::borrow::Cow::Owned(out)
+        }
+    }
+}
+
+/// 类型徽标：淡色胶囊 + 同色文字，比一坨彩色小字更容易扫读。
+///
+/// 底色用同色的低 alpha，而不是实色：这样深浅主题都能自动适配，
+/// 文字始终用实色，对比度不会被背景吃掉。
+fn kind_chip(ui: &mut egui::Ui, kind: Kind) {
+    let (label, tint) = match kind {
+        Kind::Text => ("文本", egui::Color32::from_rgb(0x18, 0x5F, 0xA5)),
+        Kind::RichText => ("富文本", egui::Color32::from_rgb(0x53, 0x4A, 0xB7)),
+        Kind::Image => ("图片", egui::Color32::from_rgb(0x0F, 0x6E, 0x56)),
+        Kind::Files => ("文件", egui::Color32::from_rgb(0x99, 0x3C, 0x1D)),
+    };
+    let fill = egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 26);
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin {
+            left: 6,
+            right: 6,
+            top: 1,
+            bottom: 1,
+        })
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(tint).strong().small());
+        });
+}
+
+/// 人可读的体积。文本类不显示，只有图片 / 文件才用到。
+/// 算缩略图在列表里的显示尺寸：高度固定，宽度按比例算、超过上限就截。
+///
+/// 小图会放大到填满高度——列表里缩略图高度一致才好横向比较，
+/// 一列大小不一的方块反而更乱。
+fn fit_thumb(source: egui::Vec2) -> egui::Vec2 {
+    if source.x <= 0.0 || source.y <= 0.0 {
+        return egui::vec2(THUMB_MAX_W, THUMB_H);
+    }
+    let scale = (THUMB_H / source.y).min(THUMB_MAX_W / source.x);
+    egui::vec2(
+        (source.x * scale).clamp(1.0, THUMB_MAX_W),
+        (source.y * scale).clamp(1.0, THUMB_H),
+    )
+}
+
+/// 算大图预览的显示尺寸：等比撑满可用区域。
+///
+/// 和 `fit_thumb` 不同，这里**不限制放大**。缩略图要求高度整齐才好横向比较，
+/// 而预览的目的就是把小图放大到能看清——用户按空格就是想看大的。
+fn fit_preview(source: egui::Vec2, avail: egui::Vec2) -> egui::Vec2 {
+    if source.x <= 0.0 || source.y <= 0.0 {
+        return avail;
+    }
+    let scale = (avail.x / source.x).min(avail.y / source.y);
+    egui::vec2(source.x * scale, source.y * scale)
+}
+
+/// 画一张缩略图，并描一圈极淡的边——浅色截图贴在浅色背景上会糊成一片。
+fn thumb_image(ui: &mut egui::Ui, thumb: &Thumb) {
+    let size = fit_thumb(thumb.source);
+    let resp = ui.add(
+        egui::Image::new(&thumb.texture)
+            .fit_to_exact_size(size)
+            .corner_radius(egui::CornerRadius::same(3)),
+    );
+    let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    ui.painter()
+        .rect_stroke(resp.rect, 3.0, stroke, egui::StrokeKind::Inside);
+}
+
+/// 缩略图还没解出来时的占位块。尺寸按最宽的形态撑开，
+/// 解码完成时最多只是变窄一点，不会把整行推着跳。
+fn thumb_placeholder(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(THUMB_MAX_W, THUMB_H), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
+}
+
+fn human_size(n: i64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{:.0} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// 数一下文件条目的路径列表里有多少个已经不存在了。
+///
+/// 网络路径（`\\server\share\...`）**不查**：目标离线时底层 `GetFileAttributesW`
+/// 会等 SMB 超时几十秒，而这里跑在 UI 线程上，会把整个窗口卡死。
+/// 这类条目保守地当作「还在」，宁可不提醒也不能卡界面。
+fn count_missing_paths(payload: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(payload);
+    text.lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter(|p| !p.starts_with("\\\\") && !p.starts_with("//"))
+        .filter(|p| !std::path::Path::new(p).exists())
+        .count()
+}
+
+/// 把 unix 毫秒格式化成**本地时间**。
+///
+/// 不能直接对时间戳取模算时分：那是 UTC，界面上会显示成差 8 小时的时间，
+/// 让人以为记录错位了。这里借 Win32 的 FILETIME 转换，夏令时之类的也一并交给系统。
+///
+/// 当天的只显示时分，更早的补上月日——列表里光看 `14:03` 分不清是哪天记的。
+fn fmt_time(ms: i64) -> String {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    use windows_sys::Win32::System::Time::FileTimeToSystemTime;
+
+    if ms <= 0 {
+        return "--:--".to_owned();
+    }
+
+    /// 1601-01-01 到 1970-01-01 之间的 100ns 数
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+
+    let ticks = EPOCH_DIFF + (ms as u64) * 10_000;
+    let utc = FILETIME {
+        dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+
+    unsafe {
+        let mut local: FILETIME = std::mem::zeroed();
+        if FileTimeToLocalFileTime(&utc, &mut local) == 0 {
+            return "--:--".to_owned();
+        }
+
+        let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&local, &mut st) == 0 {
+            return "--:--".to_owned();
+        }
+
+        let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut now);
+
+        let same_day = st.wYear == now.wYear && st.wMonth == now.wMonth && st.wDay == now.wDay;
+        if same_day {
+            format!("{:02}:{:02}", st.wHour, st.wMinute)
+        } else {
+            format!(
+                "{:02}-{:02} {:02}:{:02}",
+                st.wMonth, st.wDay, st.wHour, st.wMinute
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn fmt_time_today_is_hh_mm() {
+        // 当天记录只显示时分：5 个字符
+        let s = fmt_time(now_ms());
+        assert_eq!(s.len(), 5, "当天应显示 HH:MM，实际是 {s:?}");
+        assert_eq!(&s[2..3], ":");
+    }
+
+    #[test]
+    fn fmt_time_older_shows_date() {
+        // 3 天前带月日：MM-DD HH:MM，11 个字符
+        let old = now_ms() - 3 * 86_400_000;
+        let s = fmt_time(old);
+        assert_eq!(s.len(), 11, "跨天应显示 MM-DD HH:MM，实际是 {s:?}");
+        assert_eq!(&s[2..3], "-");
+    }
+
+    #[test]
+    fn fmt_time_is_local_not_utc() {
+        // 关键回归：以前直接对时间戳取模，显示的是 UTC，比本地慢 8 小时。
+        // 拿当前时间去比，本地时和 UTC 时至少有一个字段应该不同（除非恰好在整点边界）。
+        let ms = now_ms();
+        let shown = fmt_time(ms);
+        let hour: u32 = shown[..2].parse().expect("时");
+
+        let mut now: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
+
+        // 允许跨分钟边界造成的误差，只比小时
+        let diff = (hour as i32 - now.wHour as i32).abs();
+        assert!(
+            diff <= 1,
+            "显示的小时 {hour} 和本地小时 {} 差太多，说明还在用 UTC",
+            now.wHour
+        );
+    }
+
+    #[test]
+    fn fmt_time_handles_bad_input() {
+        assert_eq!(fmt_time(0), "--:--");
+        assert_eq!(fmt_time(-1), "--:--");
+    }
+
+    #[test]
+    fn count_missing_paths_detects_deleted_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rpaste-paths-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let existing = dir.join("here.txt");
+        let gone = dir.join("gone.txt");
+        std::fs::write(&existing, b"x").expect("写临时文件");
+        let _ = std::fs::remove_file(&gone);
+
+        let payload = format!("{}\n{}\n", existing.display(), gone.display());
+        assert_eq!(count_missing_paths(payload.as_bytes()), 1);
+
+        std::fs::remove_file(&existing).expect("删临时文件");
+        assert_eq!(count_missing_paths(payload.as_bytes()), 2);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn count_missing_paths_skips_unc() {
+        // UNC 不能真的 stat：离线时会等 SMB 超时，把 UI 卡死。
+        assert_eq!(
+            count_missing_paths(b"\\\\offline-server\\share\\a.txt\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn thumb_fit_keeps_aspect_and_caps_width() {
+        // 竖图：高度撑满，宽度按比例
+        let tall = fit_thumb(egui::vec2(600.0, 1200.0));
+        assert!((tall.y - THUMB_H).abs() < 0.01, "高度应撑满: {tall:?}");
+        assert!((tall.x - 22.0).abs() < 0.1, "宽度应按比例: {tall:?}");
+
+        // 超宽图：宽度封顶，高度按比例，不能被压成一条缝
+        let wide = fit_thumb(egui::vec2(4000.0, 1000.0));
+        assert!((wide.x - THUMB_MAX_W).abs() < 0.01, "宽度应封顶: {wide:?}");
+        assert!((wide.y - 24.0).abs() < 0.1, "高度应按比例: {wide:?}");
+
+        // 退化输入不能出现 0 或 NaN 尺寸
+        let bad = fit_thumb(egui::vec2(0.0, 0.0));
+        assert!(bad.x > 0.0 && bad.y > 0.0, "{bad:?}");
+    }
+
+    #[test]
+    fn preview_fit_fills_available_and_keeps_aspect() {
+        let avail = egui::vec2(396.0, 536.0);
+
+        // 宽图：宽度撑满，高度按比例
+        let wide = fit_preview(egui::vec2(1009.0, 713.0), avail);
+        assert!((wide.x - avail.x).abs() < 0.1, "宽图应撑满宽度: {wide:?}");
+        assert!(
+            (wide.x / wide.y - 1009.0 / 713.0).abs() < 1e-3,
+            "宽高比要保持"
+        );
+
+        // 高图：高度受限
+        let tall = fit_preview(egui::vec2(400.0, 2000.0), avail);
+        assert!((tall.y - avail.y).abs() < 0.1, "高图应撑满高度: {tall:?}");
+        assert!(tall.x < avail.x, "高图不该撑满宽度: {tall:?}");
+
+        // 小图要放大，不保留原始像素尺寸——预览的意义就是看大
+        let small = fit_preview(egui::vec2(80.0, 60.0), avail);
+        assert!(small.x > 80.0, "小图应被放大: {small:?}");
+
+        // 退化输入退回可用区域，不能给出 0 尺寸
+        let bad = fit_preview(egui::Vec2::ZERO, avail);
+        assert_eq!(bad, avail);
+    }
+    #[test]
+    fn text_view_window_starts_at_the_hit() {
+        // 命中距离开头很远：窗口要从命中处往前退一点开始，而不是从头发。
+        let text = format!(
+            "{}{}{}",
+            "铺垫".repeat(2000),
+            "命中目标",
+            "收尾".repeat(2000)
+        );
+        let (shown, hit, skipped, truncated) = text_view_window(&text, &["命中目标"], 1000);
+        assert!(skipped, "前面还有几千字，得让人知道");
+        assert!(truncated, "后面也还有");
+        assert!(shown.contains("命中目标"));
+        assert!(shown.chars().count() <= 1000);
+        // 命中偏移要落在切出来的这段里，浮层才有东西可滚。
+        let hit = hit.expect("应该有命中位置");
+        assert!(shown.is_char_boundary(hit) && shown[hit..].starts_with("命中目标"));
+    }
+
+    #[test]
+    fn text_view_window_keeps_short_text_whole() {
+        let (shown, hit, skipped, truncated) = text_view_window("一段短文本", &["短"], 1000);
+        assert_eq!(shown, "一段短文本");
+        assert!(!skipped && !truncated);
+        assert_eq!(hit, Some("一段".len()), "字节偏移，不是字符序号");
+    }
+}
