@@ -18,6 +18,7 @@ use crate::capture::{Command, CopyRequest};
 use crate::model::{Kind, denormalize_newlines};
 use crate::search::{Counts, Index, KindFilter, match_ranges};
 use crate::store::{EntryMeta, ReadStore};
+use crate::theme;
 use crate::thumb::{PreviewState, Thumb, Thumbs};
 use crate::win;
 
@@ -171,6 +172,17 @@ pub struct App {
     /// 全文浮层的内容缓存。浮层每帧都要画这段文字，不能每帧去库里读一遍
     /// payload（大条目还可能是一次 blob 文件读）。
     text_view: Option<TextView>,
+    /// 上一帧鼠标所在的行。
+    ///
+    /// 底色的绘制顺序决定了它必须提前知道 hover：egui 是即时模式，`Response`
+    /// 要等内容画完才存在，而底色得画在内容**下面**。所以读上一帧的状态，
+    /// 用一帧（16ms）的延迟换正确的绘制顺序。
+    hover_row: Option<i64>,
+    /// 浮层打开的時刻（`egui` 的 input time），用于淡入。
+    ///
+    /// 不用 `animate_bool_with_time`：它在一个 id 首次出现时直接返回终值，
+    /// 于是「第一次打开」恰恰没有动画——而第一次正是最需要动画的那次。
+    overlay_opened_at: Option<f64>,
 }
 
 /// 全文浮层要显示的那一段。
@@ -222,6 +234,8 @@ impl App {
             missing_paths: HashMap::new(),
             thumbs: Thumbs::new(ctx),
             preview_id: None,
+            hover_row: None,
+            overlay_opened_at: None,
             text_view: None,
         };
         app.refresh();
@@ -677,6 +691,25 @@ impl App {
     }
 
     /// 切类型筛选。再点一次当前档位等于取消筛选（回到「全部」）。
+    /// 浮层淡入进度：`0.0` 刚打开，`1.0` 完全展开。
+    ///
+    /// 自己按时间算，不走 `animate_bool_with_time`：后者在 id 首次出现时
+    /// 直接返回终值，于是「第一次打开」恰好没有动画，而第一次正是最该有的那次。
+    fn overlay_fade(&mut self, ctx: &egui::Context) -> f32 {
+        let Some(t0) = self.overlay_opened_at else {
+            return 1.0;
+        };
+        let now = ctx.input(|i| i.time);
+        let raw = ((now - t0) / theme::ANIM_BASE as f64).clamp(0.0, 1.0) as f32;
+        if raw < 1.0 {
+            // 进度是自己算的，egui 不知道动画还没走完——得显式要下一帧，
+            // 否则淡入会停在第 1 帧（这个窗口空闲时本来就不重绘）。
+            ctx.request_repaint();
+        }
+        // ease-out：开头快、结尾缓，比线性更像「弹出来」而不是「淡出来」。
+        1.0 - (1.0 - raw) * (1.0 - raw)
+    }
+
     fn set_filter(&mut self, filter: KindFilter) {
         self.filter = if self.filter == filter {
             KindFilter::All
@@ -726,17 +759,27 @@ impl App {
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
 
             let visuals = ui.visuals();
-            if resp.hovered() {
-                ui.painter()
-                    .rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+            // hover 底色淡入而不是凭空出现：这个小叉子面积不小，
+            // 瞬间亮起一块底色在静止的界面里很扎眼。
+            let hover_t = ui.ctx().animate_bool_with_time(
+                egui::Id::new("search-clear-hover"),
+                resp.hovered(),
+                theme::ANIM_FAST,
+            );
+            if hover_t > 0.01 {
+                ui.painter().rect_filled(
+                    rect,
+                    theme::RADIUS_SM,
+                    theme::wash(visuals.widgets.hovered.bg_fill, (255.0 * hover_t) as u8),
+                );
             }
             // 叉号自己画两条线，不用字符：egui 默认字体里没有 ✕ (U+2715)，
             // 直接写会渲染成豆腐块。画线还顺手解决了「不同字号下粗细不一」。
-            let color = if resp.hovered() {
-                visuals.strong_text_color()
-            } else {
-                visuals.weak_text_color()
-            };
+            let color = blend(
+                visuals.weak_text_color(),
+                visuals.strong_text_color(),
+                hover_t,
+            );
             let c = rect.center();
             let d = 4.0;
             let stroke = egui::Stroke::new(1.4, color);
@@ -754,11 +797,11 @@ impl App {
 
         // 类型筛选 chip。计数直接标在标签上——「图片 3」比只看「图片」信息量大，
         // 也让用户一眼知道切过去是不是空的。
-        ui.add_space(5.0);
+        ui.add_space(theme::GAP_SM);
         let counts = self.counts;
         let mut picked = None;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.spacing_mut().item_spacing.x = theme::GAP_SM;
             if let Some(f) = filter_chips(ui, self.filter, counts) {
                 picked = Some(f);
             }
@@ -785,6 +828,8 @@ impl App {
         let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
         // 先取快照：渲染过程中不能一边读一边清，否则后面的条目判断就乱了。
         let scroll_to_selected = self.scroll_to_selected;
+        // 本帧鼠标落在哪一行，循环结束后写回 `hover_row`（供下一帧绘制底色）。
+        let mut next_hover = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -806,6 +851,15 @@ impl App {
                 for entry in &entries {
                     let created = fmt_time(entry.created_at);
                     let is_selected = self.selected == Some(entry.id);
+
+                    // hover 底色：目标值是上一帧的 hover 状态，插值由 egui 推进
+                    // （它会在动画期间自动 request_repaint）。
+                    let hover_prev = !locked && self.hover_row == Some(entry.id);
+                    let hover_t = ui.ctx().animate_bool_with_time(
+                        egui::Id::new(("row-hover", entry.id)),
+                        hover_prev,
+                        theme::ANIM_FAST,
+                    );
                     let missing = self.missing_paths.get(&entry.id).copied().unwrap_or(0);
 
                     // 这一行是否落在可视区。缩略图排队靠它：解码很贵，
@@ -845,11 +899,14 @@ impl App {
                     // 半透明高亮：深浅主题都透出底色，不会把文字盖住。
                     let sel = ui.visuals().selection.bg_fill;
                     let bg = if is_selected {
-                        Some(egui::Color32::from_rgba_unmultiplied(
-                            sel.r(),
-                            sel.g(),
-                            sel.b(),
-                            58,
+                        Some(theme::wash(sel, 58))
+                    } else if hover_t > 0.01 {
+                        // hover 底比选中更淡，而且用文字色而非选中色：
+                        // 选中是「这是当前项」，hover 只是「鼠标在这」，
+                        // 两者可能同时出现，必须一眼分得清主次。
+                        Some(theme::wash(
+                            ui.visuals().text_color(),
+                            (14.0 * hover_t).round() as u8,
                         ))
                     } else {
                         None
@@ -857,12 +914,12 @@ impl App {
 
                     let mut frame = egui::Frame::new()
                         .inner_margin(egui::Margin {
-                            left: 8,
-                            right: 8,
-                            top: 5,
-                            bottom: 5,
+                            left: theme::CARD_PAD_X,
+                            right: theme::CARD_PAD_X,
+                            top: theme::CARD_PAD_Y,
+                            bottom: theme::CARD_PAD_Y,
                         })
-                        .corner_radius(5.0);
+                        .corner_radius(theme::RADIUS_MD);
                     if let Some(bg) = bg {
                         frame = frame.fill(bg);
                     }
@@ -872,17 +929,13 @@ impl App {
                     let body = |ui: &mut egui::Ui| {
                         ui.horizontal(|ui| {
                             if entry.pinned {
-                                ui.label(
-                                    egui::RichText::new("★")
-                                        .color(egui::Color32::from_rgb(228, 172, 45))
-                                        .size(12.0),
-                                );
+                                ui.label(egui::RichText::new("★").color(theme::PIN).size(12.0));
                             }
                             kind_chip(ui, entry.kind);
                             if missing > 0 {
                                 ui.label(
                                     egui::RichText::new(format!("源文件已失效 ({missing})"))
-                                        .color(egui::Color32::from_rgb(0xE2, 0x4B, 0x4A))
+                                        .color(theme::DANGER)
                                         .small(),
                                 );
                             }
@@ -920,7 +973,7 @@ impl App {
                                         Some(t) => thumb_image(ui, t),
                                         None => thumb_placeholder(ui),
                                     }
-                                    ui.add_space(6.0);
+                                    ui.add_space(theme::GAP_MD);
                                     let width = ui.available_width();
                                     ui.vertical(|ui| {
                                         ui.set_width(width);
@@ -957,6 +1010,7 @@ impl App {
 
                     if resp.hovered() && !locked {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                        next_hover = Some(entry.id);
                     }
 
                     // 选中项左侧一条强调竖条：浅色主题下光靠底色几乎看不出来。
@@ -977,9 +1031,11 @@ impl App {
                             ui.visuals().widgets.noninteractive.bg_stroke,
                         );
                     }
-                    ui.add_space(5.0);
+                    ui.add_space(theme::GAP_SM);
                 }
             });
+
+        self.hover_row = next_hover;
 
         // 本帧已经处理过滚动请求，清掉，避免之后每帧都把视图拽回选中项
         if scroll_to_selected {
@@ -1007,12 +1063,15 @@ impl App {
         // 文本类走全文浮层。列表里那条预览只存了前 512 字（长文本连两行都
         // 显示不满），想看全只能在这里——不然「复制过的东西看不到全貌」。
         if matches!(entry.kind, Kind::Text | Kind::RichText) {
-            if self.ui_text_view(ui, &entry) {
+            let fade = self.overlay_fade(ui.ctx());
+            if self.ui_text_view(ui, &entry, fade) {
                 self.preview_id = None;
                 self.text_view = None;
             }
             return;
         }
+
+        let fade = self.overlay_fade(ui.ctx());
 
         // 解码请求每帧都要问一次，否则纹理解出来了也没人来取。
         let state = self
@@ -1036,8 +1095,13 @@ impl App {
                 }
 
                 // 压到接近全黑：列表还亮着的话，看图时文字和分隔线会一直往眼里钻。
+                // 打开时按 `fade` 从透明压下来，避免整块黑屏突然盖住。
                 let painter = ui.painter();
-                painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(244));
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_black_alpha((244.0 * fade) as u8),
+                );
 
                 match &state {
                     PreviewState::Ready(thumb) => {
@@ -1091,7 +1155,7 @@ impl App {
     ///
     /// 为什么不把全文直接铺在列表里：512 字的预览折行后已经能吃掉大半个窗口，
     /// 八千字的正文会把列表冲得找不着北。列表负责「扫」，浮层负责「读」。
-    fn ui_text_view(&mut self, ui: &mut egui::Ui, entry: &EntryMeta) -> bool {
+    fn ui_text_view(&mut self, ui: &mut egui::Ui, entry: &EntryMeta, fade: f32) -> bool {
         // 浮层里的高亮沿用列表那套：同一个搜索词，在任何地方都应该被标出来。
         let query = self.search.trim().to_owned();
         let terms: Vec<&str> = query.split_whitespace().collect();
@@ -1139,19 +1203,28 @@ impl App {
                 if resp.clicked() {
                     close = true;
                 }
-                ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(210));
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_black_alpha((210.0 * fade) as u8),
+                );
 
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(screen.shrink(10.0))
+                        // 卡片从下方 8px 处滑到位：位移比纯淡入更有「弹出」感，
+                        // 8px 足够被感知又不会真的晃眼。
+                        .max_rect(
+                            screen
+                                .shrink(10.0)
+                                .translate(egui::vec2(0.0, (1.0 - fade) * 8.0)),
+                        )
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
 
                 egui::Frame::new()
                     .fill(ui.visuals().window_fill)
                     .stroke(ui.visuals().window_stroke)
-                    .corner_radius(8.0)
+                    .corner_radius(theme::RADIUS_LG)
                     .inner_margin(10.0)
                     .show(&mut child, |ui| {
                         ui.set_width(ui.available_width());
@@ -1290,6 +1363,14 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// 全透明：让窗口背后的系统材质透上来。
+    ///
+    /// 面板自己画半透明底色，所以文字对比度仍然受我们控制——这里只是把
+    /// 「最底层」交给 DWM，而不是自己铺一块纯色。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 隐藏窗口正常不会有 RedrawRequested，但万一有也不该重建整个列表。
         if !win::is_main_window_visible() {
@@ -1309,6 +1390,14 @@ impl eframe::App for App {
 
         // 点窗口关闭按钮不退出，收进托盘。先 CancelClose 阻止 eframe 销毁窗口，
         // 再用 Win32 把它藏起来。退出走托盘菜单（由 listener 直接处理）。
+        // 浮层打开的時刻只记一次，用于淡入进度。收起来时清掉，下次重新计时。
+        if self.preview_id.is_some() {
+            self.overlay_opened_at
+                .get_or_insert_with(|| ctx.input(|i| i.time));
+        } else {
+            self.overlay_opened_at = None;
+        }
+
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             win::hide_main_window();
@@ -1321,6 +1410,21 @@ impl eframe::App for App {
             self.ui_preview(ui);
         });
     }
+}
+
+/// 两个颜色按 `t` 线性混合（含 alpha）。
+///
+/// 用来做颜色过渡。egui 只提供给数值插值的接口，颜色插值得自己做——
+/// 但它比直接切颜色舒服得多，尤其「淡底 + 淡字」需要一起变的时候。
+fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
 }
 
 /// 把某个字符从本帧的文本事件里摘掉。
@@ -1349,30 +1453,10 @@ fn drain_keys(ctx: &egui::Context, key: egui::Key) -> usize {
 /// 顶部那一排类型筛选 chip。返回用户点中的档位（没有点击则 `None`）。
 fn filter_chips(ui: &mut egui::Ui, current: KindFilter, counts: Counts) -> Option<KindFilter> {
     let items = [
-        (
-            "全部",
-            KindFilter::All,
-            counts.all,
-            egui::Color32::from_rgb(0x5B, 0x6B, 0x7A),
-        ),
-        (
-            "文本",
-            KindFilter::Text,
-            counts.text,
-            egui::Color32::from_rgb(0x18, 0x5F, 0xA5),
-        ),
-        (
-            "图片",
-            KindFilter::Image,
-            counts.image,
-            egui::Color32::from_rgb(0x0F, 0x6E, 0x56),
-        ),
-        (
-            "文件",
-            KindFilter::Files,
-            counts.files,
-            egui::Color32::from_rgb(0x99, 0x3C, 0x1D),
-        ),
+        ("全部", KindFilter::All, counts.all, theme::KIND_ALL),
+        ("文本", KindFilter::Text, counts.text, theme::KIND_TEXT),
+        ("图片", KindFilter::Image, counts.image, theme::KIND_IMAGE),
+        ("文件", KindFilter::Files, counts.files, theme::KIND_FILES),
     ];
 
     let mut picked = None;
@@ -1393,39 +1477,41 @@ fn filter_chip(
     active: bool,
     tint: egui::Color32,
 ) -> bool {
-    let (fill, color, stroke) = if active {
-        (
-            egui::Color32::from_rgb(0x2C, 0x5E, 0x8A),
-            egui::Color32::WHITE,
-            egui::Stroke::NONE,
-        )
-    } else if n == 0 {
+    // 选中态切换做一次插值：chip 是最高频点击的控件，瞬间换色显得生硬。
+    // `animate_bool_with_time` 对一直存在的 id 才有意义——chip 恰好符合。
+    let anim = ui.ctx().animate_bool_with_time(
+        ui.make_persistent_id(("chip", label)),
+        active,
+        theme::ANIM_BASE,
+    );
+
+    let (idle_fill, idle_color) = if n == 0 {
         // 没内容的档位弱化，但仍可点——点了能看到「这个类型还没有记录」。
-        (
-            egui::Color32::TRANSPARENT,
-            ui.visuals().weak_text_color(),
-            egui::Stroke::NONE,
+        (egui::Color32::TRANSPARENT, ui.visuals().weak_text_color())
+    } else {
+        (theme::wash(tint, 24), tint)
+    };
+    let fill = blend(idle_fill, theme::ACCENT, anim);
+    let color = blend(idle_color, egui::Color32::WHITE, anim);
+    // 描边只在未选中时存在，跟着一起淡出，不然选中后会留一圈深色边。
+    let stroke = if n > 0 && anim < 0.99 {
+        egui::Stroke::new(
+            1.0,
+            blend(theme::wash(tint, 60), egui::Color32::TRANSPARENT, anim),
         )
     } else {
-        (
-            egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 24),
-            tint,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 60),
-            ),
-        )
+        egui::Stroke::NONE
     };
 
     let resp = egui::Frame::new()
         .fill(fill)
         .stroke(stroke)
-        .corner_radius(9.0)
+        .corner_radius(theme::RADIUS_PILL)
         .inner_margin(egui::Margin {
-            left: 8,
-            right: 8,
-            top: 3,
-            bottom: 3,
+            left: theme::CHIP_PAD_X,
+            right: theme::CHIP_PAD_X,
+            top: theme::CHIP_PAD_Y,
+            bottom: theme::CHIP_PAD_Y,
         })
         .show(ui, |ui| {
             ui.label(
@@ -1578,15 +1664,15 @@ fn truncate_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
 /// 文字始终用实色，对比度不会被背景吃掉。
 fn kind_chip(ui: &mut egui::Ui, kind: Kind) {
     let (label, tint) = match kind {
-        Kind::Text => ("文本", egui::Color32::from_rgb(0x18, 0x5F, 0xA5)),
-        Kind::RichText => ("富文本", egui::Color32::from_rgb(0x53, 0x4A, 0xB7)),
-        Kind::Image => ("图片", egui::Color32::from_rgb(0x0F, 0x6E, 0x56)),
-        Kind::Files => ("文件", egui::Color32::from_rgb(0x99, 0x3C, 0x1D)),
+        Kind::Text => ("文本", theme::KIND_TEXT),
+        Kind::RichText => ("富文本", theme::KIND_RICH),
+        Kind::Image => ("图片", theme::KIND_IMAGE),
+        Kind::Files => ("文件", theme::KIND_FILES),
     };
-    let fill = egui::Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 26);
+    let fill = theme::wash(tint, 26);
     egui::Frame::new()
         .fill(fill)
-        .corner_radius(4.0)
+        .corner_radius(theme::RADIUS_SM)
         .inner_margin(egui::Margin {
             left: 6,
             right: 6,
@@ -1632,11 +1718,15 @@ fn thumb_image(ui: &mut egui::Ui, thumb: &Thumb) {
     let resp = ui.add(
         egui::Image::new(&thumb.texture)
             .fit_to_exact_size(size)
-            .corner_radius(egui::CornerRadius::same(3)),
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS_XS as u8)),
     );
     let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
-    ui.painter()
-        .rect_stroke(resp.rect, 3.0, stroke, egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        resp.rect,
+        theme::RADIUS_XS,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// 缩略图还没解出来时的占位块。尺寸按最宽的形态撑开，
@@ -1644,7 +1734,7 @@ fn thumb_image(ui: &mut egui::Ui, thumb: &Thumb) {
 fn thumb_placeholder(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(THUMB_MAX_W, THUMB_H), egui::Sense::hover());
     ui.painter()
-        .rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
+        .rect_filled(rect, theme::RADIUS_XS, ui.visuals().faint_bg_color);
 }
 
 fn human_size(n: i64) -> String {

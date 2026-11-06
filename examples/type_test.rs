@@ -399,6 +399,22 @@ fn main() {
     }
 
     // --esc：按一次 Esc。用来验证「预览开着时 Esc 只关浮层、不收窗口」。
+    // --hover <x> <y>：把鼠标移到窗口内相对坐标再抓图，用来看 hover 态。
+    // 动画有 0.1~0.16s，所以等 400ms 才抓——要抓稳定态，不是过渡态。
+    if first == "--hover" {
+        let x: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let y: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        let mut rect = unsafe { zeroed() };
+        unsafe { GetWindowRect(hwnd, &mut rect) };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos;
+        unsafe { SetCursorPos(rect.left + x, rect.top + y) };
+        std::thread::sleep(std::time::Duration::from_millis(420));
+        let _ = shoot(hwnd, "hover.png");
+        println!("hover 到窗口内 ({x},{y})，已抓图 hover.png");
+        return;
+    }
+
     // --click-rel <x> <y>：按窗口相对坐标点一下，抓图看效果。
     // 用来验证画在控件内部、没有独立可测入口的小按钮（比如搜索框的清除键）。
     if first == "--click-rel" {

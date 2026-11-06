@@ -4,16 +4,20 @@
 //! 比截屏可靠——截屏会拍到挡在上面的浏览器，还有抢不到前台的问题。
 //!
 //! 用法：cargo run --release --example shot_window -- out.png
+//!
+//! 加 `--screen` 抓整个屏幕而不是窗口本身。区别很关键：`PrintWindow` 拿到的是
+//! **窗口自己画的内容**，不含 DWM 在它背后合成的系统材质；要确认亚克力/圆角
+//! 真的生效，必须看屏幕的最终合成结果。
 
 use std::mem::zeroed;
 use std::ptr;
 
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows_sys::Win32::Storage::Xps::PrintWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, GetWindowRect};
 
 use rpaste::win::window;
 
@@ -21,8 +25,11 @@ use rpaste::win::window;
 const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 
 fn main() {
-    let out = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let full_screen = args.iter().any(|a| a == "--screen");
+    let out = args
+        .into_iter()
+        .find(|a| !a.starts_with("--"))
         .unwrap_or_else(|| "window_shot.png".to_string());
 
     let Some(hwnd) = window::main_window() else {
@@ -40,6 +47,13 @@ fn main() {
             eprintln!("GetWindowRect 失败");
             std::process::exit(1);
         }
+        // 整屏模式下 rect 换成整个屏幕，后面 BitBlt 从屏幕 DC 直接拷贝。
+        if full_screen {
+            rect.left = 0;
+            rect.top = 0;
+            rect.right = GetSystemMetrics(0); // SM_CXSCREEN
+            rect.bottom = GetSystemMetrics(1); // SM_CYSCREEN
+        }
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
         if w <= 0 || h <= 0 {
@@ -52,8 +66,15 @@ fn main() {
         let bmp = CreateCompatibleBitmap(screen, w, h);
         let old = SelectObject(mem, bmp);
 
-        let ok = PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT);
-        println!("PrintWindow -> {ok}，窗口 {w}x{h}");
+        if full_screen {
+            // 屏幕 DC 直接拷：拿到的是 DWM 合成后的最终画面，系统材质、圆角、
+            // 半透明都在里面。
+            let ok = BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY);
+            println!("BitBlt -> {ok}，整屏 {w}x{h}");
+        } else {
+            let ok = PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT);
+            println!("PrintWindow -> {ok}，窗口 {w}x{h}");
+        }
 
         let mut bmi: BITMAPINFO = zeroed();
         bmi.bmiHeader = BITMAPINFOHEADER {

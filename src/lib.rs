@@ -9,6 +9,7 @@ pub mod model;
 pub mod pinyin;
 pub mod search;
 pub mod store;
+pub mod theme;
 pub mod thumb;
 pub mod ui;
 pub mod win;

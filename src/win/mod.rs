@@ -10,6 +10,6 @@ pub mod tray;
 pub mod window;
 
 pub use window::{
-    hide_main_window, is_main_window_visible, paste_to_previous, poke_repaint, show_at_cursor,
-    show_main_window, toggle_main_window,
+    apply_backdrop, hide_main_window, is_main_window_visible, paste_to_previous, poke_repaint,
+    show_at_cursor, show_main_window, toggle_main_window,
 };

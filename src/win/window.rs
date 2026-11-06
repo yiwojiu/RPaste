@@ -21,10 +21,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL, VK_V,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, FindWindowW, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindowVisible, PostMessageW, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    WM_PAINT,
+    BringWindowToTop, FindWindowW, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP, IsIconic,
+    IsWindowVisible, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, WM_PAINT, WS_EX_LAYERED,
 };
 
 /// eframe 主窗口的标题，`main.rs` 里 `with_title` 设的就是它。
@@ -149,6 +149,80 @@ pub fn poke_repaint() {
     let Some(hwnd) = main_window() else { return };
     unsafe {
         let _ = PostMessageW(hwnd, WM_PAINT, 0, 0);
+    }
+}
+
+/// 给主窗口套上系统材质：Win11 的圆角 + 亚克力背景。
+///
+/// 为什么交给 DWM 而不是在 egui 里画：真正的毛玻璃要模糊「窗口背后的像素」，
+/// 而 egui 是即时模式、没有层合成树，拿不到下层内容。系统材质由桌面窗口
+/// 管理器合成，效果更准（跟随壁纸、跟随明暗主题），开销也更低。
+///
+/// 失败不影响功能：Win10 及更早版本不认识这些属性，调用返回错误码，
+/// 窗口退回 egui 自己画的半透明底色，只是少了那层材质。
+pub fn apply_backdrop() {
+    use windows_sys::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::Controls::MARGINS;
+
+    let Some(hwnd) = main_window() else { return };
+
+    // 直接用数值而不是 `windows_sys` 里的常量名：这两个属性是 Win11 才加的，
+    // 老版本 bindings 里没有，写死数字反而不会因为依赖升级而编译失败。
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+    const DWMWCP_ROUND: u32 = 2;
+    /// 亚克力（`DWMSBT_TRANSIENTWINDOW`）。这里**不用** Mica：
+    /// Mica 是给常驻主窗口的，采样壁纸后基本静止；剪贴板面板是随时弹出的
+    /// 临时浮层，需要的是「看得出背后有东西在动」的通透感，那是亚克力的特征。
+    const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
+    unsafe {
+        // 诊断：分层窗口（`WS_EX_LAYERED`）会让 DWM 拒绝合成背景材质——
+        // 那种窗口的透明由应用自己负责，系统不再模糊它背后的内容。
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        crate::log_info!(
+            "窗口扩展样式 {ex:#x}，LAYERED={}",
+            (ex & WS_EX_LAYERED) != 0
+        );
+
+        // 窗口圆角。客户区是我们自己画的，圆角由 DWM 裁外框。
+        let mut corner = DWMWCP_ROUND;
+        let hr = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &mut corner as *mut u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if hr < 0 {
+            crate::log_info!("圆角属性不可用（{hr:#x}），可能是 Win10");
+        }
+
+        let mut backdrop = DWMSBT_TRANSIENTWINDOW;
+        let hr = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &mut backdrop as *mut u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if hr < 0 {
+            crate::log_info!("系统材质不可用（{hr:#x}），退回纯色背景");
+        }
+
+        // 关键一步：让 DWM 把整个客户区纳入「框架扩展」范围。
+        //
+        // 不做这一步，材质只画在系统框架那几像素上，客户区仍然归应用所有，
+        // 于是透明帧缓冲直接把**后面窗口的原始像素**透上来——文字清晰、没有
+        // 模糊，比不透明还难看。全 -1 是约定写法，表示扩展到整个客户区。
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        if hr < 0 {
+            crate::log_info!("客户区扩帧失败（{hr:#x}），材质无法铺满");
+        }
     }
 }
 

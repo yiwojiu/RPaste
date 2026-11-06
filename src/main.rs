@@ -94,6 +94,9 @@ fn run() -> anyhow::Result<()> {
             .with_inner_size([420.0, 560.0])
             .with_min_inner_size([320.0, 320.0])
             .with_title("R-Paste")
+            // 透明帧缓冲：底下的系统材质（亚克力）要能透上来。面板自己画
+            // 半透明底色，所以文字对比度仍然由我们控制，不依赖壁纸。
+            .with_transparent(true)
             .with_icon(window_icon),
         ..Default::default()
     };
@@ -106,6 +109,9 @@ fn run() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             ui::App::install_cjk_font(&cc.egui_ctx);
+            rpaste::theme::install(&cc.egui_ctx);
+            // 窗口此刻已经建好（`CreationContext` 在窗口之后回调），套上系统材质。
+            rpaste::win::apply_backdrop();
             let _ = ui::EGUI_CTX.set(cc.egui_ctx.clone());
             Ok(Box::new(ui::App::new(
                 &cc.egui_ctx,
