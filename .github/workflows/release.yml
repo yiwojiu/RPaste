@@ -1,0 +1,107 @@
+name: Release
+
+# 打 tag 就发版：编译 → 打包 → 算校验和 → 建 Release，全程用仓库自带的
+# GITHUB_TOKEN（见下方 permissions），不需要任何人工 token。
+on:
+  push:
+    tags: ["v*"]
+  # 手动跑一次可以验证流水线本身是否健康，不会建 Release（没有 tag）。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一标签重复触发时排队而不是并行：两个 job 同时上传同名资产，
+# 后一个会以 "already_exists" 失败。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+
+      # 包名带版本号之后，标签和 Cargo.toml 不一致反而更误导：下载页写着
+      # v0.2.0，里面文件名却是 0.1.9。在这里挡住，比事后发现好。
+      # workflow_dispatch 没有标签，跳过这项检查。
+      - name: 读取版本号（并校验与标签一致）
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::标签 ${GITHUB_REF_NAME} 与 Cargo.toml 的 v${VERSION} 不一致，先改 Cargo.toml 再打标签"
+            exit 1
+          fi
+
+      # --locked：依赖版本以 Cargo.lock 为准。不加的话 CI 会顺手升级
+      # 次要版本，本地能跑的构建在 CI 上可能挂，且两次构建产物不一致。
+      - name: 构建
+        run: cargo build --release --locked
+
+      # 压缩包里套一层与压缩包同名的目录：解压不会把文件散在当前目录，
+      # 几个版本解压到同一个下载目录也不会互相覆盖。
+      - name: 打包
+        shell: pwsh
+        run: |
+          $name = "rpaste-v${{ steps.ver.outputs.value }}-x86_64-pc-windows-msvc"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target/release/rpaste.exe $stage
+          Copy-Item README.md $stage
+          Copy-Item LICENSE $stage
+          # 显式字符串拼接而不是 "$name.zip"：后者在双引号里会被当作属性访问，
+          # 语义随 PowerShell 版本和变量类型而变。
+          Compress-Archive -Path $stage -DestinationPath ($name + ".zip") -Force
+          Get-Item ($name + ".zip") | Select-Object Name, Length
+
+      - name: 生成 SHA256
+        shell: bash
+        run: |
+          # 只列压缩包：写成 `sha256sum *` 的话，能否避开把自己（SHA256SUMS.txt）
+          # 也算进去取决于重定向与通配展开的先后，显式写通配更稳。
+          sha256sum rpaste-v*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rpaste-v*.zip
+            SHA256SUMS.txt
+          draft: false
+          body: |
+            Windows 剪贴板历史工具。Alt+V 唤出，内存索引搜索，支持文本 / 图片 / 文件。
+
+            ## 功能
+
+            - **文本 / 图片 / 文件**三类历史，`Ctrl+0/1/2/3` 切换筛选
+            - **内存索引搜索**：1 万条全量扫描约 2 ms，常规查询微秒级；多词空格分隔（AND）
+            - **拼音首字母**：`wj` 命中「文件」
+            - **命中高亮 + 上下文**，`Alt+Enter` 打开全文并自动滚到命中处
+            - **收藏置顶** `Ctrl+P`，清空历史时保留
+            - **Alt+1~9** 直接粘贴第 N 条
+            - 空格看图片大图预览，`Del` 删除
+
+            ## 安装
+
+            下载 `rpaste-v${{ steps.ver.outputs.value }}-x86_64-pc-windows-msvc.zip`，解压后双击 `rpaste.exe`，
+            无需安装、无运行时依赖（字体与 SQLite 已内置）。要求 Windows 10 x64 及以上。
+
+            数据保存在 `%LOCALAPPDATA%\RPaste\`。
+
+            ## 校验
+
+            同目录的 `SHA256SUMS.txt` 里有压缩包的 SHA256。
