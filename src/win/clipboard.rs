@@ -73,60 +73,124 @@ impl Drop for Guard {
     }
 }
 
-/// 读取当前剪贴板内容。只做文本，图片/文件留给 M2。
+/// 读取当前剪贴板内容。
 ///
 /// 返回 `None` 的情况：剪贴板被占用、内容为空、或对方带隐私标记。
 pub fn read() -> Option<Captured> {
-    let _guard = match Guard::acquire() {
-        Some(g) => g,
-        None => {
-            // 别的程序（或自己上一轮没收尾）占着剪贴板。这是「复制了但没记下来」
-            // 最常见的元凶，必须留下线索。
-            crate::log_error!("OpenClipboard 失败，重试 {OPEN_RETRIES} 次仍未拿到剪贴板");
+    // 剪贴板只在「拷原始数据」这一小段持有，转码和哈希放到关掉之后。
+    //
+    // 实测 4K 截图的 DIB→PNG 在 release 下要 150ms，debug 下更久；一直占着
+    // 剪贴板，系统里其他程序这段时间全粘不上东西——实测会打出
+    // 「OpenClipboard 失败」，那已经不是「少记一条」，而是干扰别人干活了。
+    let raw = {
+        let _guard = match Guard::acquire() {
+            Some(g) => g,
+            None => {
+                // 别的程序（或自己上一轮没收尾）占着剪贴板。这是「复制了但没记下来」
+                // 最常见的元凶，必须留下线索。
+                crate::log_error!("OpenClipboard 失败，重试 {OPEN_RETRIES} 次仍未拿到剪贴板");
+                return None;
+            }
+        };
+
+        if is_monitoring_opted_out() {
             return None;
         }
+
+        read_raw()?
     };
 
-    if is_monitoring_opted_out() {
-        return None;
-    }
-
-    // 格式优先级是有讲究的：
-    // 1. CF_HDROP 最高——存在就几乎一定是文件复制，此时剪贴板里往往还有一份
-    //    文件名的纯文本，不能让它抢先生效。
-    // 2. 文本次之——Excel 复制单元格会同时塞一张渲染图，用户想要的是文本。
-    // 3. 图片最后——截图工具只有图片，没有文本，自然落到这里。
-    if let Some(c) = read_files() {
-        return Some(c);
-    }
-    if let Some(c) = read_text() {
-        return Some(c);
-    }
-    if let Some(c) = read_image() {
-        return Some(c);
-    }
-
-    None
+    raw.finish()
 }
 
-fn read_text() -> Option<Captured> {
+/// 锁内读到的原始内容，还没转成 `Captured`。
+///
+/// 拆这一层是为了把「必须持有剪贴板」的部分压到最短：只有判断格式、
+/// 拷字节、读文本三步需要锁，哈希、预览、DIB→PNG 都是纯 CPU，锁外算。
+enum Raw {
+    /// 换行分隔的绝对路径。
+    Files(Vec<String>),
+    /// 已经做过换行归一化的文本。
+    Text(String),
+    /// 已经是 PNG 字节（源程序直接给了 `PNG` 格式）。
+    Png(Vec<u8>),
+    /// 原始 DIB，还要现场转码。
+    Dib(Vec<u8>),
+}
+
+impl Raw {
+    fn finish(self) -> Option<Captured> {
+        match self {
+            Raw::Files(paths) => {
+                // 预览要能当搜索索引：多选文件时把每个文件名都列出来，否则
+                // 「选中 5 个文件」的条目只能搜到第一个，剩下的等于不存在。
+                // 上限 20 个名——再长就截断，preview 本身也有字符上限。
+                let preview = if paths.len() == 1 {
+                    file_name_of(&paths[0])
+                } else {
+                    let names: Vec<String> =
+                        paths.iter().take(20).map(|p| file_name_of(p)).collect();
+                    let tail = if paths.len() > names.len() {
+                        " 等"
+                    } else {
+                        ""
+                    };
+                    make_preview(
+                        &format!("{} 个文件：{}{tail}", paths.len(), names.join("、")),
+                        PREVIEW_CHARS,
+                    )
+                };
+                let payload = paths.join("\n").into_bytes();
+                Some(Captured::new(Kind::Files, payload, preview))
+            }
+            Raw::Text(text) => {
+                // 尾部单独留一份：剪贴板里真正长的东西（配置、日志、整段 SQL）
+                // 只有前 512 字能被搜到是绝对不够的。
+                let (preview, tail) = make_preview_and_tail(&text, PREVIEW_CHARS, TAIL_CHARS);
+                Some(Captured::new(Kind::Text, text.into_bytes(), preview).with_tail(tail))
+            }
+            Raw::Png(bytes) => {
+                let (w, h) = png_size(&bytes)?;
+                // 预览只留尺寸：体积已经显示在元数据行，重复一遍是噪音。
+                Some(Captured::new(Kind::Image, bytes, format!("图片 {w}×{h}")))
+            }
+            Raw::Dib(dib) => {
+                let png = dib_to_png(&dib)?;
+                let (w, h) = png_size(&png)?;
+                Some(Captured::new(Kind::Image, png, format!("图片 {w}×{h}")))
+            }
+        }
+    }
+}
+
+/// 格式优先级是有讲究的：
+/// 1. CF_HDROP 最高——存在就几乎一定是文件复制，此时剪贴板里往往还有一份
+///    文件名的纯文本，不能让它抢先生效。
+/// 2. 文本次之——Excel 复制单元格会同时塞一张渲染图，用户想要的是文本。
+/// 3. 图片最后——截图工具只有图片，没有文本，自然落到这里。
+fn read_raw() -> Option<Raw> {
+    if let Some(paths) = read_files() {
+        return Some(Raw::Files(paths));
+    }
+    if let Some(text) = read_text() {
+        return Some(Raw::Text(text));
+    }
+    read_image()
+}
+
+fn read_text() -> Option<String> {
     let text = read_wide_text(CF_UNICODETEXT)?;
     let normalized = normalize_newlines(&text);
     if normalized.trim().is_empty() {
         return None;
     }
-
-    // 哈希、预览和检索用的正文尾部都在读取线程里算完，worker 只负责落库。
-    // 尾部单独留一份：剪贴板里真正长的东西（配置、日志、整段 SQL）只有前
-    // 512 字能被搜到是绝对不够的。
-    let (preview, tail) = make_preview_and_tail(&normalized, PREVIEW_CHARS, TAIL_CHARS);
-    Some(Captured::new(Kind::Text, normalized.into_bytes(), preview).with_tail(tail))
+    Some(normalized)
 }
 
 /// 读取 CF_HDROP（资源管理器里复制的文件/文件夹）。
 ///
-/// 存成换行分隔的绝对路径。预览只显示文件名，完整路径留给粘贴时用。
-fn read_files() -> Option<Captured> {
+/// 返回绝对路径列表（存库时拼成换行分隔的一列），预览在锁外拼。
+fn read_files() -> Option<Vec<String>> {
     unsafe {
         if IsClipboardFormatAvailable(CF_HDROP) == 0 {
             return None;
@@ -158,30 +222,7 @@ fn read_files() -> Option<Captured> {
             paths.push(String::from_utf16_lossy(&buf));
         }
 
-        if paths.is_empty() {
-            return None;
-        }
-
-        // 预览要能当搜索索引：多选文件时把每个文件名都列出来，否则
-        // 「选中 5 个文件」的条目只能搜到第一个，剩下的等于不存在。
-        // 上限 20 个名——再长就截断，preview 本身也有字符上限。
-        let preview = if paths.len() == 1 {
-            file_name_of(&paths[0])
-        } else {
-            let names: Vec<String> = paths.iter().take(20).map(|p| file_name_of(p)).collect();
-            let tail = if paths.len() > names.len() {
-                " 等"
-            } else {
-                ""
-            };
-            make_preview(
-                &format!("{} 个文件：{}{tail}", paths.len(), names.join("、")),
-                PREVIEW_CHARS,
-            )
-        };
-
-        let payload = paths.join("\n").into_bytes();
-        Some(Captured::new(Kind::Files, payload, preview))
+        if paths.is_empty() { None } else { Some(paths) }
     }
 }
 
@@ -190,8 +231,8 @@ fn file_name_of(path: &str) -> String {
 }
 
 /// 读取图片。优先 `PNG` 格式（浏览器/现代应用会给，已压缩且带 alpha），
-/// 否则吃 `CF_DIBV5` / `CF_DIB` 现场转码。
-fn read_image() -> Option<Captured> {
+/// 否则交出 `CF_DIBV5` / `CF_DIB` 的原始字节，转码在锁外做。
+fn read_image() -> Option<Raw> {
     unsafe {
         let png_fmt = format_id(&FMT_PNG, "PNG");
         // 用 let-chain 一次判完：格式已注册、剪贴板里有、字节像 PNG、能读出尺寸。
@@ -201,11 +242,9 @@ fn read_image() -> Option<Captured> {
             && let Some(bytes) = read_blob(png_fmt)
             && bytes.len() > 8
             && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-            && let Some((w, h)) = png_size(&bytes)
+            && png_size(&bytes).is_some()
         {
-            // 预览只留尺寸：体积已经显示在元数据行，重复一遍是噪音。
-            // 尺寸本身仍有意义——两张力标不同的图，缩略图看着都差不多。
-            return Some(Captured::new(Kind::Image, bytes, format!("图片 {w}×{h}")));
+            return Some(Raw::Png(bytes));
         }
 
         for fmt in [CF_DIBV5, CF_DIB] {
@@ -216,11 +255,7 @@ fn read_image() -> Option<Captured> {
             if dib.len() > MAX_DIB_BYTES {
                 continue;
             }
-            let Some(png) = dib_to_png(&dib) else {
-                continue;
-            };
-            let (w, h) = png_size(&png)?;
-            return Some(Captured::new(Kind::Image, png, format!("图片 {w}×{h}")));
+            return Some(Raw::Dib(dib));
         }
     }
     None

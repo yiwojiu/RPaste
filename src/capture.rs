@@ -19,7 +19,16 @@ use crate::model::{Captured, Kind};
 use crate::store::{InsertOutcome, Store};
 use crate::win::clipboard;
 
-const READ_TIMEOUT: Duration = Duration::from_millis(400);
+/// 等一次读取的上限。
+///
+/// 这个值原本是 400ms，实测不够：PixPin 这类截图工具点「复制并关闭」时用的是
+/// **延迟渲染**（`SetClipboardData(fmt, NULL)`，等别人来要才现场生成），
+/// `GetClipboardData` 要同步等它生成，慢一点就超。日志里那几条
+/// 「seq NNN 读取超时」都是这么来的——一次都抓不到。
+///
+/// 1500ms 是取舍：正常文本/图片读取是几毫秒到一百多毫秒，留给「源程序慢」
+/// 的余量足够；再大就变成「剪贴板真卡住时，worker 陪着一起卡两秒」。
+const READ_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// worker 是否已经把 WAL 合并完、准备退出了。
 ///
@@ -262,7 +271,12 @@ impl Capture {
             }
             Err(()) => {
                 self.stats.timeouts += 1;
-                crate::log_warn!("seq {seq} 读取超时，源程序可能卡在延迟渲染，已放弃");
+                // 带上实际等了多久：这个数是判断「放宽超时够不够」的唯一依据，
+                // 只写「超时」等于把线索丢掉。
+                crate::log_warn!(
+                    "seq {seq} 读取超时（{}ms），源程序可能卡在延迟渲染，已放弃",
+                    started.elapsed().as_millis()
+                );
             }
         }
     }
