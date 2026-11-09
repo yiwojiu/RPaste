@@ -65,6 +65,9 @@ pub const KEY_PAD_X: f32 = 5.0;
 pub const FONT_SM: f32 = 11.0;
 /// 正文。
 pub const FONT_BODY: f32 = 13.0;
+/// 浮层标题（「设置」这类只有一个词的标题）。比正文大一档就够，
+/// 再大在 300px 宽的卡片里会显得空。
+pub const FONT_TITLE: f32 = 14.0;
 /// 底部状态栏：键帽用 `FONT_SM`，说明文字用这一档。
 /// 比 Small 大一档——它在窗口最下沿，离眼睛最远，11px 撑不住。
 pub const FONT_FOOT: f32 = 12.0;

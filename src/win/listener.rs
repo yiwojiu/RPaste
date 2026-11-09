@@ -6,7 +6,7 @@
 //!
 //! 回调里只做「投递」，绝不打开剪贴板：
 //! - `WM_CLIPBOARDUPDATE` → 取序列号 → `seq_tx`
-//! - `WM_HOTKEY`（`Alt+V`）→ `event_tx` 发 `Toggle`
+//! - `WM_HOTKEY`（默认 `Alt+V`，可配置）→ 切换主窗口可见性
 //! - `TRAY_MSG`（托盘）→ `event_tx` 发 `Toggle` / `Quit`
 //!
 //! 两个 channel 容量都是 1：消费方没来得及取走时直接丢弃。
@@ -30,8 +30,6 @@ use super::{hotkey, tray, window};
 const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 const WM_HOTKEY: u32 = 0x0312;
 const WM_DESTROY: u32 = 0x0002;
-
-const HOTKEY_ID: i32 = 0x52; // 与 hotkey::register 里的一致
 
 /// 退出时用来通知 worker 收尾。
 static CMD_TX: OnceLock<crossbeam_channel::Sender<crate::capture::Command>> = OnceLock::new();
@@ -135,6 +133,9 @@ fn run() -> anyhow::Result<()> {
         // 让读取线程能用这个窗口作为 OpenClipboard 的 owner。
         crate::win::clipboard::set_owner(hwnd);
 
+        // 记下句柄：UI 改完热键后会往这个窗口投递重注册请求。
+        hotkey::set_listener(hwnd);
+
         if AddClipboardFormatListener(hwnd) == 0 {
             anyhow::bail!("AddClipboardFormatListener 失败");
         }
@@ -145,7 +146,8 @@ fn run() -> anyhow::Result<()> {
 
         // Win+V 被 Shell 独占，`RegisterHotKey` 抢不到，接管要靠低级键盘钩子。
         // 那条路实测能拦到按键，但存在「第一次按不响应」的时序问题，暂时搁置，
-        // 只用 `Alt+V`（见 `hook` 模块，代码保留待后续修）。
+        // 只用 `Alt+V`（见 `hook` 模块，代码保留待后续修）。默认组合可以在
+        // 设置面板里改，改完由 `WM_RELOAD_HOTKEY` 回到这个线程重新注册。
 
         if tray::add(hwnd) {
             crate::log_info!("托盘图标已就绪");
@@ -182,10 +184,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         WM_HOTKEY => {
-            if w as i32 == HOTKEY_ID {
+            // 录制新组合时不要切窗口：那一刻按下的很可能正是当前生效的热键，
+            // 系统已经把它从键盘上吞掉了，再顺手把窗口收起就完全没法操作了。
+            if w as i32 == hotkey::ID && !hotkey::is_capturing() {
                 // 直接调 Win32 切换可见性，不经过 UI 线程：
                 // 窗口隐藏时 UI 的 update 不会执行，事件递不过去。
                 window::toggle_main_window();
+            }
+            0
+        }
+        hotkey::WM_RELOAD_HOTKEY => {
+            // 只能在**注册它的线程**上撤/注册，所以改键必须绕回这里。
+            // 失败时 `apply` 内部已经回滚到旧组合，这里只负责记一笔。
+            match unsafe { hotkey::reload(hwnd) } {
+                Ok(()) => crate::log_info!("热键已切换为 {}", hotkey::Hotkey::load().label()),
+                Err(err) => crate::log_warn!("{err}，沿用原热键"),
             }
             0
         }

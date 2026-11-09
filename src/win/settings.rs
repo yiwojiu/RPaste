@@ -14,6 +14,16 @@ use windows_sys::Win32::System::Registry::{
 const KEY: &str = r"Software\RPaste";
 /// `1` = 接管 Win+V（默认），`0` = 交还系统剪贴板历史。
 const VALUE_WIN_V: &str = "TakeOverWinV";
+/// 呼出热键的修饰键位（`MOD_ALT` = 1、`MOD_CONTROL` = 2、`MOD_SHIFT` = 4）。
+const VALUE_HOTKEY_MODS: &str = "HotkeyMods";
+/// 呼出热键的虚拟键码（默认 0x56 = `V`）。
+const VALUE_HOTKEY_VK: &str = "HotkeyVk";
+/// 上次关闭时的窗口逻辑尺寸（像素）。两个值分开存，缺一个就当没存过。
+const VALUE_WINDOW_W: &str = "WindowWidth";
+const VALUE_WINDOW_H: &str = "WindowHeight";
+
+/// 默认热键 `Alt+V`，与 `hotkey::Hotkey::DEFAULT` 保持一致。
+const DEFAULT_HOTKEY: (u32, u32) = (1, 0x56);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -100,4 +110,32 @@ pub fn win_v_takeover() -> bool {
 
 pub fn set_win_v_takeover(on: bool) -> Result<(), String> {
     write_dword(VALUE_WIN_V, on as u32)
+}
+
+/// 呼出热键：`(修饰键位, 虚拟键码)`。
+///
+/// 读不到就给默认值。两个值必须成对出现，所以这里没有「半个热键」的中间态。
+pub fn hotkey() -> (u32, u32) {
+    let mods = read_dword(VALUE_HOTKEY_MODS).unwrap_or(DEFAULT_HOTKEY.0);
+    let vk = read_dword(VALUE_HOTKEY_VK).unwrap_or(DEFAULT_HOTKEY.1);
+    (mods, vk)
+}
+
+pub fn set_hotkey(mods: u32, vk: u32) -> Result<(), String> {
+    write_dword(VALUE_HOTKEY_MODS, mods)?;
+    write_dword(VALUE_HOTKEY_VK, vk)
+}
+
+/// 上次的窗口逻辑尺寸，没存过或数值离谱就返回 `None`（调用方用默认值）。
+pub fn window_size() -> Option<(u32, u32)> {
+    let w = read_dword(VALUE_WINDOW_W)?;
+    let h = read_dword(VALUE_WINDOW_H)?;
+    // 320 是 `min_inner_size`；比它还小的值只可能来自手动改注册表，
+    // 采信它会让窗口开在一个拖不动也看不全的尺寸上。
+    (w >= 320 && h >= 320).then_some((w, h))
+}
+
+pub fn set_window_size(w: u32, h: u32) -> Result<(), String> {
+    write_dword(VALUE_WINDOW_W, w)?;
+    write_dword(VALUE_WINDOW_H, h)
 }

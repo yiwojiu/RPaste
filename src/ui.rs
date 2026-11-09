@@ -21,6 +21,7 @@ use crate::store::{EntryMeta, ReadStore};
 use crate::theme;
 use crate::thumb::{PreviewState, Thumb, Thumbs};
 use crate::win;
+use crate::win::hotkey::{self, Hotkey};
 
 const RECENT_LIMIT: usize = 200;
 
@@ -105,6 +106,12 @@ pub fn spawn_repaint_guard() {
 /// 「清空历史」的确认有效期。清空不可撤销，所以点两次才执行；
 /// 两次之间超过这个时间就当用户放弃了，按钮收回待确认态。
 const CLEAR_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 默认窗口尺寸（逻辑像素）。
+///
+/// `main.rs` 首次启动、设置面板的「恢复默认尺寸」都用这一个数——两处各写
+/// 一个值的话，「恢复默认」会跳到一个用户从没见过的大小。
+pub const DEFAULT_WINDOW: (f32, f32) = (420.0, 560.0);
 
 /// `Alt+1..9` 对应的数字键，顺序即「列表第几条」。
 const QUICK_PASTE_KEYS: [egui::Key; 9] = [
@@ -199,6 +206,21 @@ pub struct App {
     /// 不用 `animate_bool_with_time`：它在一个 id 首次出现时直接返回终值，
     /// 于是「第一次打开」恰恰没有动画——而第一次正是最需要动画的那次。
     overlay_opened_at: Option<f64>,
+    /// 设置面板是否打开。
+    settings_open: bool,
+    /// 设置面板里是否正在「录」新热键（等用户按键）。
+    recording: bool,
+    /// 设置面板里的一次性反馈：`(文案, 是否成功)`。成功用强调色，失败用红色。
+    setting_note: Option<(String, bool)>,
+    /// 当前生效的呼出热键。启动时读一次注册表，改键成功后同步更新。
+    hotkey: Hotkey,
+    /// 上一次落盘的窗口尺寸，用来判断「用户还在拖」还是「已经停手」。
+    size_saved: (u32, u32),
+    /// 正在等待落盘的尺寸：`(尺寸, 这个尺寸第一次出现的时刻)`。
+    ///
+    /// 拖动窗口时每帧尺寸都在变，逐帧写注册表既浪费又会把中间态写进去。
+    /// 只有「同一个尺寸稳定了半秒」才认为用户松手了。
+    size_pending: Option<((u32, u32), f64)>,
 }
 
 /// 全文浮层要显示的那一段。
@@ -253,6 +275,12 @@ impl App {
             hover_row: None,
             overlay_opened_at: None,
             text_view: None,
+            settings_open: false,
+            recording: false,
+            setting_note: None,
+            hotkey: Hotkey::load(),
+            size_saved: (0, 0),
+            size_pending: None,
         };
         app.refresh();
         app
@@ -500,11 +528,30 @@ impl App {
 
         if self.was_focused && !focused {
             win::hide_main_window();
-        } else if !self.was_focused && focused {
+            // 窗口收起来了，设置面板没有理由留到下次唤出——用户再按热键
+            // 是想看历史，不是想接着改设置。
+            self.close_settings();
+        } else if !self.was_focused && focused && !self.settings_open {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
         }
 
         self.was_focused = focused;
+    }
+
+    /// 收起设置面板，顺带清掉录制态和一次性提示。
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.recording = false;
+        self.setting_note = None;
+    }
+
+    /// 打开设置面板。每次打开都重新读一遍注册表：万一用户手改了注册表，
+    /// 面板显示的应该是「现在真正生效的」，而不是上次读到的。
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        self.recording = false;
+        self.setting_note = None;
+        self.hotkey = Hotkey::load();
     }
 
     /// 搜索词一变就丢掉选中项。
@@ -530,6 +577,32 @@ impl App {
     /// 或者处理慢时的补帧），而 `consume_key` 一次只摘掉一个。
     /// 不循环的话，快按几下只会动一格，手感很粘。
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Ctrl+K 开关设置面板。
+        //
+        // 放在最前面：面板开着时也要能按键关掉，否则只能去点「完成」或者点空白。
+        // 这也是唯一一条不依赖鼠标的入口——鼠标点击要求窗口已是前台，
+        // 而这个窗口一失焦就自己收起。
+        //
+        // 不用更符合直觉的 `Ctrl+,`：逗号经 winit 进来是 `Key::Character(",")`，
+        // 实测 egui 侧拿不到 `Key::Comma`（`Ctrl+comma` 在真键盘上同样不触发），
+        // 而字母键这条路径是通的。
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
+            if self.settings_open {
+                self.close_settings();
+            } else {
+                self.open_settings();
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("search")));
+            }
+            return;
+        }
+
+        // 设置面板打开时，列表的快捷键全部让路：这时候按 Del 想删的是
+        // 刚录进去的那个组合，不是某条历史；按 Alt+1 更不该直接粘出去。
+        if self.settings_open {
+            self.handle_settings_keys(ctx);
+            return;
+        }
+
         // Esc 是分层退出：浮层开着先关浮层，再按一次才收窗口。
         // 直接收窗口的话，用户想退掉大图就整个界面没了，得重新按一次热键。
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -671,6 +744,280 @@ impl App {
                 } else {
                     self.on_activate(&entry);
                 }
+            }
+        }
+    }
+
+    /// 设置面板里的按键。
+    ///
+    /// 只有两件事：Esc 分级退出（录制态先取消录制），录制态下把下一次按键
+    /// 收成新热键。其余按键一律不响应——面板打开时列表的快捷键已经全部让路。
+    fn handle_settings_keys(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if self.recording {
+                self.recording = false;
+            } else {
+                self.close_settings();
+            }
+            return;
+        }
+        if !self.recording {
+            return;
+        }
+
+        // 取第一个「带修饰键的按下事件」。修饰键本身不产生 `Event::Key`，
+        // 所以这里拿到的组合已经带着当次按下的 Ctrl/Alt/Shift 状态。
+        let picked = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Hotkey::from_key(*key, *modifiers),
+                _ => None,
+            })
+        });
+        let Some(hk) = picked else {
+            // 用户按了个裸键：不认，继续等。这里不能退出录制态，
+            // 否则「先按了 Shift 再按 V」会被当成失败。
+            return;
+        };
+
+        self.recording = false;
+        // 录成了当前正在用的组合：探测必然失败（占着它的就是我们自己），
+        // 直接给一句人话，别报「被其他程序占用」让人去找冲突。
+        if hk == self.hotkey {
+            self.setting_note = Some((format!("已经是 {}", hk.label()), true));
+            return;
+        }
+        match hotkey::try_apply(hk) {
+            Ok(()) => {
+                self.hotkey = hk;
+                self.setting_note = Some((format!("已切换为 {}", hk.label()), true));
+            }
+            Err(err) => self.setting_note = Some((err, false)),
+        }
+    }
+
+    /// 设置面板：呼出热键 + 窗口尺寸。
+    ///
+    /// 用独立 `Area` 压暗 + `Window` 承载卡片：卡片高度由内容决定，
+    /// 而 `Window` 的 `anchor` 每帧按实际尺寸重新居中，不用先估高度。
+    fn ui_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+
+        // 压暗。点空白处收起——这层在卡片之前创建，所以永远画在卡片下面。
+        let mut clicked_outside = false;
+        egui::Area::new(egui::Id::new("settings-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
+                clicked_outside = resp.clicked();
+            });
+
+        let visuals = ctx.style().visuals.clone();
+        let mut close = false;
+        let mut start_recording = false;
+        let mut reset_hotkey = false;
+        let mut reset_size = false;
+
+        egui::Window::new("settings-card")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(visuals.window_fill)
+                    .stroke(visuals.window_stroke)
+                    .corner_radius(theme::RADIUS_LG)
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(290.0);
+                ui.label(egui::RichText::new("设置").size(theme::FONT_BODY).strong());
+                ui.add_space(theme::GAP_MD);
+                ui.separator();
+                ui.add_space(theme::GAP_MD);
+
+                // ---- 呼出快捷键
+                section_label(ui, "呼出快捷键");
+                ui.add_space(theme::GAP_SM);
+                ui.horizontal(|ui| {
+                    if self.recording {
+                        ui.label(
+                            egui::RichText::new("请按下组合键…")
+                                .size(theme::FONT_BODY)
+                                .color(theme::ACCENT),
+                        );
+                    } else {
+                        keycap_sized(ui, &self.hotkey.label(), theme::FONT_BODY, 24.0);
+                        ui.add_space(theme::GAP_MD);
+                        if ghost_button(
+                            ui,
+                            egui::Id::new("hotkey-edit"),
+                            "修改",
+                            theme::ACCENT,
+                            false,
+                        )
+                        .clicked()
+                        {
+                            start_recording = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.hotkey != Hotkey::DEFAULT
+                                && ghost_button(
+                                    ui,
+                                    egui::Id::new("hotkey-reset"),
+                                    "恢复默认",
+                                    theme::ACCENT,
+                                    false,
+                                )
+                                .clicked()
+                            {
+                                reset_hotkey = true;
+                            }
+                        });
+                    }
+                });
+                ui.add_space(theme::GAP_XS);
+                hint_label(
+                    ui,
+                    if self.recording {
+                        "按 Esc 取消。组合里必须有 Ctrl / Alt / Shift 之一。"
+                    } else {
+                        "点「修改」后按下新的组合键，立即生效。"
+                    },
+                );
+
+                // ---- 窗口大小
+                ui.add_space(theme::GAP_LG);
+                ui.separator();
+                ui.add_space(theme::GAP_MD);
+                section_label(ui, "窗口大小");
+                ui.add_space(theme::GAP_SM);
+                ui.horizontal(|ui| {
+                    let size = ctx.content_rect().size();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} × {}",
+                            size.x.round() as i32,
+                            size.y.round() as i32
+                        ))
+                        .size(theme::FONT_BODY)
+                        .color(visuals.text_color()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ghost_button(
+                            ui,
+                            egui::Id::new("size-reset"),
+                            "恢复默认尺寸",
+                            theme::ACCENT,
+                            false,
+                        )
+                        .clicked()
+                        {
+                            reset_size = true;
+                        }
+                    });
+                });
+                ui.add_space(theme::GAP_XS);
+                hint_label(ui, "拖动窗口边缘即可调整，下次打开按这个尺寸恢复。");
+
+                // ---- 一次性反馈（改键成功 / 被占用）
+                if let Some((note, ok)) = &self.setting_note {
+                    ui.add_space(theme::GAP_MD);
+                    ui.label(
+                        egui::RichText::new(note)
+                            .size(theme::FONT_SM)
+                            .color(if *ok { theme::ACCENT } else { theme::DANGER }),
+                    );
+                }
+
+                ui.add_space(theme::GAP_LG);
+                // 收尾按钮必须包在 `ui.horizontal` 里：裸 `with_layout` 会拿到
+                // 整块剩余高度，把它撑成一条从内容底部到窗口底部的空白。
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ghost_button(
+                            ui,
+                            egui::Id::new("settings-done"),
+                            "完成",
+                            theme::ACCENT,
+                            false,
+                        )
+                        .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if start_recording {
+            self.recording = true;
+            self.setting_note = None;
+        }
+        if reset_hotkey {
+            match hotkey::try_apply(Hotkey::DEFAULT) {
+                Ok(()) => {
+                    self.hotkey = Hotkey::DEFAULT;
+                    self.setting_note =
+                        Some((format!("已恢复为 {}", Hotkey::DEFAULT.label()), true));
+                }
+                Err(err) => self.setting_note = Some((err, false)),
+            }
+        }
+        if reset_size {
+            // 只改窗口，不动注册表里的记忆：用户松手后 `persist_window_size`
+            // 会把新尺寸写回去，记忆自然跟上。
+            let (w, h) = DEFAULT_WINDOW;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+        }
+        if close || clicked_outside {
+            self.close_settings();
+        }
+    }
+
+    /// 把当前窗口尺寸记到注册表。
+    ///
+    /// 拖动过程中每帧尺寸都在变，逐帧写注册表既浪费又会存下中间态。
+    /// 所以只在「同一个尺寸稳定了半秒」时落一次盘——那个时刻基本等于用户松手。
+    fn persist_window_size(&mut self, ctx: &egui::Context) {
+        let size = ctx.content_rect().size();
+        let now = (size.x.round() as u32, size.y.round() as u32);
+        if now == self.size_saved {
+            self.size_pending = None;
+            return;
+        }
+
+        let time = ctx.input(|i| i.time);
+        match self.size_pending {
+            Some((pending, since)) if pending == now => {
+                if time - since >= 0.5 {
+                    if let Err(err) = win::settings::set_window_size(now.0, now.1) {
+                        crate::log_warn!("窗口尺寸保存失败: {err}");
+                    } else {
+                        self.size_saved = now;
+                    }
+                    self.size_pending = None;
+                } else {
+                    // 稳定期内还得有一帧来检查：窗口静止时 egui 不会自己重绘。
+                    ctx.request_repaint_after(std::time::Duration::from_millis(520));
+                }
+            }
+            _ => {
+                self.size_pending = Some((now, time));
+                ctx.request_repaint_after(std::time::Duration::from_millis(520));
             }
         }
     }
@@ -835,12 +1182,37 @@ impl App {
         ui.add_space(theme::GAP_SM);
         let counts = self.counts;
         let mut picked = None;
+        let mut open_settings = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = theme::GAP_SM;
             if let Some(f) = filter_chips(ui, self.filter, counts) {
                 picked = Some(f);
             }
+            // 设置放在这一行的右端，而不是底栏：底栏左半边要放四组快捷键提示，
+            // 再挤第二个按钮就会像刚才那样叠在「Ctrl+P 收藏」上面。
+            // 这一行右侧本来就空着，而且「设置」是低频动作，放次级行更合适。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 计数多到把 chip 排到行尾时，宁可先不显示按钮，也不要压住 chip。
+                if ui.available_width() > 60.0
+                    && ghost_button(
+                        ui,
+                        egui::Id::new("header-settings"),
+                        "设置",
+                        theme::ACCENT,
+                        false,
+                    )
+                    .clicked()
+                {
+                    open_settings = true;
+                }
+            });
         });
+        if open_settings {
+            self.open_settings();
+            // 设置面板打开后不该再往搜索框里打字，先把焦点交出去。
+            ui.ctx()
+                .memory_mut(|m| m.surrender_focus(egui::Id::new("search")));
+        }
         if let Some(f) = picked {
             self.set_filter(f);
         }
@@ -852,7 +1224,7 @@ impl App {
         let searching = !self.search.trim().is_empty();
         // 预览浮层盖住列表时不响应点击——否则点在图上会把下面那行也一起选中，
         // 甚至触发粘贴。列表照常绘制，只是不再接收交互。
-        let locked = self.preview_id.is_some();
+        let locked = self.preview_id.is_some() || self.settings_open;
         // 搜索词拆一次给整轮渲染用；来源是 `self.search`，得先脱开借用，
         // 循环里还要 &mut self 处理点击和缩略图。
         let terms: Vec<String> = if searching {
@@ -1429,7 +1801,7 @@ impl App {
                 } else {
                     "清空历史"
                 };
-                if footer_button(ui, label, confirming).clicked() {
+                if footer_button(ui, egui::Id::new("footer-clear"), label, confirming).clicked() {
                     if confirming {
                         self.confirm_clear = None;
                         if self.tx.send(Command::Clear).is_ok() {
@@ -1471,6 +1843,9 @@ impl eframe::App for App {
         self.tick_focus(ctx);
         self.poll_notify();
         self.sync_search_state();
+        // 录制热键时，系统级热键会被系统先吞掉（WM_HOTKEY 直接进 listener），
+        // 那时候再去 toggle 窗口就会「录到一半窗口消失」。所以状态同步给 listener。
+        hotkey::set_capturing(self.recording);
         self.handle_keys(ctx);
 
         // 浮层显示的是「某一条」。选中项换人或被删掉之后继续盖着，
@@ -1519,6 +1894,11 @@ impl eframe::App for App {
             self.ui_list(ui);
             self.ui_preview(ui);
         });
+
+        // 设置面板盖在最上层（Foreground），要最后画，否则会被面板内容盖住。
+        self.ui_settings(ctx);
+        // 尺寸落盘放在最后：这一帧的 `content_rect` 包含了本轮所有视口命令的结果。
+        self.persist_window_size(ctx);
     }
 }
 
@@ -1652,13 +2032,18 @@ fn filter_chip(
 /// 颜色从 `text_color()` 推：浅色主题下文字近黑，淡黑底正好是浅灰卡片；
 /// 深色主题下文字近白，同一段代码给出的是浅色浮起块。不写死 RGB。
 fn keycap(ui: &mut egui::Ui, key: &str) -> egui::Response {
+    keycap_sized(ui, key, theme::FONT_FOOT, theme::KEY_H)
+}
+
+/// 同 `keycap`，但字号和高度由调用方给。
+///
+/// 底部状态栏要「和按钮一样高」（`KEY_H`），设置面板里的热键展示则要更醒目
+/// 一档——同一个视觉元素，两种尺寸需求，所以把尺寸抽成参数。
+fn keycap_sized(ui: &mut egui::Ui, key: &str, font_size: f32, height: f32) -> egui::Response {
     let color = ui.visuals().text_color();
-    let font = egui::FontId::new(theme::FONT_FOOT, egui::FontFamily::Proportional);
+    let font = egui::FontId::new(font_size, egui::FontFamily::Proportional);
     let galley = ui.painter().layout_no_wrap(key.to_owned(), font, color);
-    let size = egui::vec2(
-        galley.size().x.ceil() + theme::KEY_PAD_X * 2.0,
-        theme::KEY_H,
-    );
+    let size = egui::vec2(galley.size().x.ceil() + theme::KEY_PAD_X * 2.0, height);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
 
     let painter = ui.painter();
@@ -1673,12 +2058,20 @@ fn keycap(ui: &mut egui::Ui, key: &str) -> egui::Response {
     resp
 }
 
-/// 底部状态栏的按钮（目前只有「清空历史」）。
+/// 状态栏和设置面板里的按钮：平时只有描边（ghost），hover 才浮起。
 ///
-/// 不用 `ui.button`：默认按钮是实心填充，在这一条 32px 的窄带里像一块补丁。
-/// 平时只给描边（ghost），hover 才浮起，确认态直接切成实心 `DANGER`——
+/// 不用 `ui.button`：默认按钮是实心填充，在 32px 的窄带里像一块补丁。
+/// `solid` 表示「已经在问你了」的状态（清空历史的二次确认），实心 + 白字——
 /// 破坏性操作在按下之前就该换一副面孔，而不是等按完再说。
-fn footer_button(ui: &mut egui::Ui, label: &str, confirming: bool) -> egui::Response {
+///
+/// `accent` 决定强调色：破坏性操作给 `DANGER`，普通操作给 `ACCENT`。
+fn ghost_button(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    label: &str,
+    accent: egui::Color32,
+    solid: bool,
+) -> egui::Response {
     // 先量字、再占位、最后按 hover 上色：按钮尺寸由文字决定，颜色却要等
     // 交互结果才知道。用 `PLACEHOLDER` 排版 + 绘制时覆盖颜色绕开这个顺序。
     let font = egui::FontId::new(theme::FONT_FOOT, egui::FontFamily::Proportional);
@@ -1689,25 +2082,21 @@ fn footer_button(ui: &mut egui::Ui, label: &str, confirming: bool) -> egui::Resp
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
 
     let hover = ui.ctx().animate_bool_with_time(
-        ui.make_persistent_id("footer-btn"),
-        resp.hovered() && !confirming,
+        id.with("hover"),
+        resp.hovered() && !solid,
         theme::ANIM_FAST,
     );
     let text = ui.visuals().text_color();
-    let (fill, stroke, color) = if confirming {
-        (theme::DANGER, egui::Stroke::NONE, egui::Color32::WHITE)
+    let (fill, stroke, color) = if solid {
+        (accent, egui::Stroke::NONE, egui::Color32::WHITE)
     } else {
         (
-            theme::wash(theme::DANGER, (20.0 * hover) as u8),
+            theme::wash(accent, (20.0 * hover) as u8),
             egui::Stroke::new(
                 1.0,
-                blend(
-                    theme::wash(text, 46),
-                    theme::wash(theme::DANGER, 110),
-                    hover,
-                ),
+                blend(theme::wash(text, 46), theme::wash(accent, 110), hover),
             ),
-            blend(ui.visuals().weak_text_color(), theme::DANGER, hover),
+            blend(ui.visuals().weak_text_color(), accent, hover),
         )
     };
 
@@ -1722,6 +2111,29 @@ fn footer_button(ui: &mut egui::Ui, label: &str, confirming: bool) -> egui::Resp
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+/// 底部状态栏的「清空历史」：红系的 `ghost_button`。
+fn footer_button(ui: &mut egui::Ui, id: egui::Id, label: &str, confirming: bool) -> egui::Response {
+    ghost_button(ui, id, label, theme::DANGER, confirming)
+}
+
+/// 设置面板里的小标题。
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(theme::FONT_FOOT)
+            .color(blend(
+                ui.visuals().weak_text_color(),
+                ui.visuals().text_color(),
+                0.5,
+            )),
+    );
+}
+
+/// 设置面板里的说明文字：弱化、小一号，但不到看不清。
+fn hint_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(theme::FONT_SM).weak());
 }
 
 /// 列表里的预览行：等宽字体、最多 `PREVIEW_ROWS` 行、超出用省略号收尾。

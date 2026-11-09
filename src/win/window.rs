@@ -91,6 +91,24 @@ pub fn show_at_cursor() {
         let mut x = pt.x + GAP;
         let mut y = pt.y + GAP;
 
+        // 尺寸记忆会让窗口比眼前这块屏幕还大（换过显示器、拔了外接屏都常见），
+        // 那种窗口一旦弹出来，右边和下边就永远在人手够不到的地方——还因为
+        // 记着尺寸，下次打开照旧。所以在工作区放不下时先收缩，再定位。
+        //
+        // 收缩只改长边：等比缩放会把用户特意调成的窄高形状压扁。
+        let max_w = (work.right - work.left).max(320);
+        let max_h = (work.bottom - work.top).max(320);
+        let mut new_w = win_w;
+        let mut new_h = win_h;
+        if new_w > max_w {
+            new_w = max_w;
+        }
+        if new_h > max_h {
+            new_h = max_h;
+        }
+        let resized = new_w != win_w || new_h != win_h;
+        let (win_w, win_h) = (new_w, new_h);
+
         // 右边放不下就翻到光标左侧
         if x + win_w > work.right {
             x = pt.x - win_w - GAP;
@@ -104,7 +122,12 @@ pub fn show_at_cursor() {
         x = x.clamp(work.left, (work.right - win_w).max(work.left));
         y = y.clamp(work.top, (work.bottom - win_h).max(work.top));
 
-        SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+        let flags = if resized {
+            SWP_SHOWWINDOW
+        } else {
+            SWP_NOSIZE | SWP_SHOWWINDOW
+        };
+        SetWindowPos(hwnd, HWND_TOP, x, y, win_w, win_h, flags);
         SetForegroundWindow(hwnd);
     }
 }

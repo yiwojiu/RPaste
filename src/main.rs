@@ -89,9 +89,14 @@ fn run() -> anyhow::Result<()> {
     let window_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
         .map_err(|e| anyhow::anyhow!("图标解码失败: {e}"))?;
 
+    // 窗口尺寸跟着上次关窗时的大小走；没存过就用和「恢复默认尺寸」相同的值。
+    // 存的是「逻辑像素」，和 `ViewportBuilder` 的单位一致，换 DPI 也不会缩小。
+    let (win_w, win_h) = win::settings::window_size()
+        .map(|(w, h)| (w as f32, h as f32))
+        .unwrap_or(ui::DEFAULT_WINDOW);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 560.0])
+            .with_inner_size([win_w, win_h])
             .with_min_inner_size([320.0, 320.0])
             .with_title("R-Paste")
             // 透明帧缓冲：底下的系统材质（亚克力）要能透上来。面板自己画
