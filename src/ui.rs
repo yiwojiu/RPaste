@@ -13,6 +13,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::capture::{Command, CopyRequest};
 use crate::model::{Kind, denormalize_newlines};
@@ -101,6 +102,21 @@ pub fn spawn_repaint_guard() {
     if started.is_err() {
         crate::log_error!("无法启动 repaint guard 线程");
     }
+}
+
+/// 托盘菜单点了「设置」。
+///
+/// listener 线程碰不到 UI 的状态，而窗口隐藏时 `App::update` 根本不执行，
+/// 事件递过去也没人接。所以这里只落一个标志位：listener 先把窗口唤出来，
+/// UI 恢复渲染的第一帧再消费它。
+static SETTINGS_REQUEST: AtomicBool = AtomicBool::new(false);
+
+pub fn request_settings() {
+    SETTINGS_REQUEST.store(true, Ordering::Release);
+}
+
+fn take_settings_request() -> bool {
+    SETTINGS_REQUEST.swap(false, Ordering::Acquire)
 }
 
 /// 「清空历史」的确认有效期。清空不可撤销，所以点两次才执行；
@@ -1838,6 +1854,14 @@ impl eframe::App for App {
         // 隐藏窗口正常不会有 RedrawRequested，但万一有也不该重建整个列表。
         if !win::is_main_window_visible() {
             return;
+        }
+
+        // 托盘「设置」：listener 已经把窗口唤出来了，这里补上面板状态。
+        // 必须早于 `tick_focus`——否则这一帧的「刚获得焦点 → 聚焦搜索框」
+        // 会先把焦点塞给搜索框，面板刚开就要再抢一次。
+        if take_settings_request() {
+            self.open_settings();
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("search")));
         }
 
         self.tick_focus(ctx);

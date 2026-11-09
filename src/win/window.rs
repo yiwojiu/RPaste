@@ -51,12 +51,24 @@ pub fn main_window() -> Option<HWND> {
 /// 贴边时翻到左侧或上方，最后统一夹到当前显示器的工作区里
 /// （`rcWork` 已经排除了任务栏）。
 pub fn show_at_cursor() {
+    show_at_cursor_inner(true);
+}
+
+/// 从托盘「设置」唤出：位置同样跟光标，但**不改粘贴目标**。
+///
+/// 从托盘唤出时前台窗口是任务栏/通知区，把它记成「粘贴目标」的话，
+/// 之后双击任何一条历史都会试图往任务栏里 `Ctrl+V`。
+pub fn show_at_cursor_keep_target() {
+    show_at_cursor_inner(false);
+}
+
+fn show_at_cursor_inner(remember_target: bool) {
     let Some(hwnd) = main_window() else { return };
 
     unsafe {
         // 记住现在谁在前台，粘贴时用得上。必须在抢焦点之前取。
         let prev = GetForegroundWindow();
-        if !prev.is_null() && prev != hwnd {
+        if remember_target && !prev.is_null() && prev != hwnd {
             PREV_FOREGROUND.store(prev, Ordering::Relaxed);
         }
 

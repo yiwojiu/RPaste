@@ -205,6 +205,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         tray::TRAY_MSG => {
             match tray::on_mouse(hwnd, l) {
                 tray::TrayAction::Toggle => window::toggle_main_window(),
+                tray::TrayAction::Settings => {
+                    // 顺序不能反：先把「要开设置」记下来，再唤出窗口。
+                    // 反过来的话，ShowWindow 触发的那一帧可能先跑完整个 update，
+                    // 等标志位落下去已经没有下一帧来消费它了。
+                    crate::ui::request_settings();
+                    window::show_at_cursor_keep_target();
+                    crate::log_info!("托盘：打开设置");
+                }
                 tray::TrayAction::ToggleAutostart => match super::autostart::toggle() {
                     Ok(on) => crate::log_info!("开机自启已{}", if on { "开启" } else { "关闭" }),
                     Err(err) => crate::log_error!("切换开机自启失败: {err}"),

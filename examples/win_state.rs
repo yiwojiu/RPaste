@@ -15,9 +15,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, GetWindowRect, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetWindowPos, WindowFromPoint,
+    FindWindowW, GetForegroundWindow, GetWindowRect, IsWindowVisible, PostMessageW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, WM_KEYDOWN, WM_KEYUP, WM_RBUTTONUP, WindowFromPoint,
 };
+
+/// listener 隐藏窗口的标题（见 `src/win/listener.rs`）。
+const LISTENER_TITLE: &str = "RPasteClipboardListener";
+/// 托盘回调消息，`WM_APP + 1`（见 `src/win/tray.rs`）。
+const TRAY_MSG: u32 = 0x8000 + 1;
+/// 托盘菜单里「设置…」是第几项（从 1 数）。
+const SETTINGS_ITEM: usize = 2;
 
 fn key(vk: u16, up: bool) -> INPUT {
     // 扫描码不能省：winit 用 `lParam` 里的扫描码判断**物理键**，只填虚拟键码
@@ -119,6 +126,62 @@ fn main() {
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
+        return;
+    }
+
+    // `win_state tray-settings`：模拟右键托盘图标 → 选「设置…」。
+    //
+    // 给 listener 窗口发托盘回调消息把菜单弹出来，再往菜单窗口里投一次点击。
+    // 全程不用 `SendInput`：那需要前台权限，脚本没有。
+    if args.first().is_some_and(|a| a == "tray-settings") {
+        let title: Vec<u16> = LISTENER_TITLE.encode_utf16().chain(Some(0)).collect();
+        let listener = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if listener.is_null() {
+            println!("找不到 listener 窗口（进程没在跑？）");
+            return;
+        }
+        unsafe {
+            PostMessageW(listener, TRAY_MSG, 0, WM_RBUTTONUP as isize);
+        }
+
+        // 等菜单窗口真的出现再发键。菜单窗口的类名是固定的 `#32768`。
+        // 菜单没弹出来就发方向键/回车，按键会落到**别的**窗口上——在别人的
+        // 对话框里按一个回车，比测试失败难收拾得多。
+        let menu_class: Vec<u16> = "#32768\0".encode_utf16().collect();
+        let mut menu = std::ptr::null_mut();
+        for _ in 0..30 {
+            menu = unsafe { FindWindowW(menu_class.as_ptr(), std::ptr::null()) };
+            if !menu.is_null() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if menu.is_null() {
+            println!("菜单没弹出来（{listener:?} 收到消息但没有 TrackPopupMenu）");
+            return;
+        }
+
+        // 直接把按键消息投给菜单窗口，而不是 `SendInput`：键盘事件只会进
+        // **前台线程**的输入队列，而这个脚本没有前台权限（从外部调
+        // `SetForegroundWindow` 基本都会被拒），键会落到别的程序上。
+        // 投递到窗口的消息不经过输入队列，和前台是谁无关。
+        unsafe {
+            for _ in 0..SETTINGS_ITEM {
+                PostMessageW(menu, WM_KEYDOWN, 0x28, 0); // VK_DOWN
+                PostMessageW(menu, WM_KEYUP, 0x28, 0);
+            }
+            PostMessageW(menu, WM_KEYDOWN, 0x0D, 0); // VK_RETURN
+            PostMessageW(menu, WM_KEYUP, 0x0D, 0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        let main_title: Vec<u16> = "R-Paste\0".encode_utf16().collect();
+        let main = unsafe { FindWindowW(std::ptr::null(), main_title.as_ptr()) };
+        println!(
+            "listener={listener:?} 主窗口={main:?} visible={} foreground={:?}",
+            unsafe { IsWindowVisible(main) },
+            unsafe { GetForegroundWindow() }
+        );
         return;
     }
 

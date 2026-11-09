@@ -27,12 +27,15 @@ pub const TRAY_MSG: u32 = 0x8000 + 1;
 
 const TRAY_UID: u32 = 1;
 const MENU_TOGGLE: usize = 1;
-const MENU_AUTOSTART: usize = 2;
-const MENU_QUIT: usize = 3;
+const MENU_SETTINGS: usize = 2;
+const MENU_AUTOSTART: usize = 3;
+const MENU_QUIT: usize = 4;
 
 /// 用户在托盘菜单里选了什么，或者点了图标本身。
 pub enum TrayAction {
     Toggle,
+    /// 唤出窗口并打开设置面板。
+    Settings,
     /// 切换开机自启。
     ToggleAutostart,
     Quit,
@@ -148,11 +151,15 @@ fn show_menu(hwnd: HWND) -> TrayAction {
         }
 
         let toggle: Vec<u16> = "显示 / 隐藏\0".encode_utf16().collect();
+        let settings: Vec<u16> = "设置…\0".encode_utf16().collect();
         // 勾选状态直接读注册表，不维护自己的副本——用户可能在别处改过
         let autostart: Vec<u16> = "开机自启\0".encode_utf16().collect();
         let quit: Vec<u16> = "退出\0".encode_utf16().collect();
 
         AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle.as_ptr());
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, settings.as_ptr());
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
 
         let auto_flags = if crate::win::autostart::is_enabled() {
             MF_STRING | MF_CHECKED
@@ -183,6 +190,7 @@ fn show_menu(hwnd: HWND) -> TrayAction {
 
         match cmd as usize {
             MENU_TOGGLE => TrayAction::Toggle,
+            MENU_SETTINGS => TrayAction::Settings,
             MENU_AUTOSTART => TrayAction::ToggleAutostart,
             MENU_QUIT => TrayAction::Quit,
             _ => TrayAction::None,

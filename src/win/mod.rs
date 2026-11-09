@@ -12,5 +12,5 @@ pub mod window;
 
 pub use window::{
     apply_backdrop, hide_main_window, is_main_window_visible, paste_to_previous, poke_repaint,
-    show_at_cursor, show_main_window, toggle_main_window,
+    show_at_cursor, show_at_cursor_keep_target, show_main_window, toggle_main_window,
 };
