@@ -119,6 +119,22 @@ const QUICK_PASTE_KEYS: [egui::Key; 9] = [
     egui::Key::Num9,
 ];
 
+/// 粘贴时对文本做不做净化。
+///
+/// 用枚举而不是 `bool`：`send_copy(entry, true, false)` 读起来完全不知道那个
+/// `false` 是什么，而这个参数会实实在在改动用户粘出去的内容。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PasteMode {
+    /// 原样粘贴。
+    Raw,
+    /// 裁掉尾部空白再粘贴。
+    ///
+    /// 场景很具体：从终端、日志、浏览器地址栏复制的东西，尾部常带着一两个换行。
+    /// 粘回终端会直接执行上一行命令，粘进聊天框会多出空行。只裁尾部不裁开头——
+    /// 缩进是代码和 YAML 的内容，动了就是错的。
+    Trimmed,
+}
+
 pub struct App {
     read: ReadStore,
     tx: crossbeam_channel::Sender<Command>,
@@ -342,7 +358,7 @@ impl App {
     }
 
     /// 把一条历史发回 worker。`paste` 为真时写完后自动 Ctrl+V 到原窗口。
-    fn send_copy(&mut self, entry: &EntryMeta, paste: bool) -> bool {
+    fn send_copy(&mut self, entry: &EntryMeta, paste: bool, mode: PasteMode) -> bool {
         let Ok(Some(payload)) = self.read.load_payload(entry.id) else {
             return false;
         };
@@ -364,12 +380,7 @@ impl App {
 
         // 文本写回剪贴板时换成 CRLF，记事本 / Office 更认。
         // 图片和文件的 payload 是二进制，原样传。
-        let payload = match entry.kind {
-            Kind::Text | Kind::RichText => {
-                denormalize_newlines(&String::from_utf8_lossy(&payload)).into_bytes()
-            }
-            _ => payload,
-        };
+        let payload = paste_payload(entry.kind, payload, mode);
 
         let req = CopyRequest {
             kind: entry.kind,
@@ -378,7 +389,12 @@ impl App {
         };
 
         if self.tx.send(Command::Copy(req)).is_ok() {
-            let verb = if paste { "已粘贴" } else { "已复制" };
+            let verb = match (paste, mode) {
+                (true, PasteMode::Trimmed) => "已粘贴（去掉尾部空行）",
+                (true, PasteMode::Raw) => "已粘贴",
+                (false, PasteMode::Trimmed) => "已复制（去掉尾部空行）",
+                (false, PasteMode::Raw) => "已复制",
+            };
             self.show_toast(format!("{verb} #{}", entry.id));
             true
         } else {
@@ -396,7 +412,16 @@ impl App {
     /// 顺序见 `win::paste_to_previous`。
     fn on_activate(&mut self, entry: &EntryMeta) {
         self.selected = Some(entry.id);
-        self.send_copy(entry, true);
+        self.send_copy(entry, true, PasteMode::Raw);
+    }
+
+    /// `Ctrl+Enter`：粘之前把尾部空白裁掉。
+    ///
+    /// 这是「粘贴为纯文本」这个常见需求在本项目里的实际形态：剪贴板写回时本来
+    /// 就只挂 `CF_UNICODETEXT`，格式已经没了，剩下会咬人的只有尾部换行。
+    fn on_activate_trimmed(&mut self, entry: &EntryMeta) {
+        self.selected = Some(entry.id);
+        self.send_copy(entry, true, PasteMode::Trimmed);
     }
 
     /// 删除选中项。
@@ -605,12 +630,18 @@ impl App {
             return;
         }
 
+        // Ctrl+Enter：粘贴并裁掉尾部空白。
+        //
+        // 必须在普通的 Enter 之前消费：`consume_key` 按修饰键精确匹配，两者
+        // 不会互相抢；但先问 Ctrl 版本能保证「按住 Ctrl 按回车」不会被当成
+        // 一次普通粘贴——那种情况下尾部换行正是要消掉的东西。
+        let ctrl_enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
 
         let ups = drain_keys(ctx, egui::Key::ArrowUp);
         let downs = drain_keys(ctx, egui::Key::ArrowDown);
 
-        if ups == 0 && downs == 0 && !enter {
+        if ups == 0 && downs == 0 && !enter && !ctrl_enter {
             return;
         }
 
@@ -626,7 +657,7 @@ impl App {
             self.step_selection(&list, 1);
         }
 
-        if enter {
+        if enter || ctrl_enter {
             // 没选中就直接拿第一条——`Alt+V` 后一路 Enter 是最顺手的路径。
             let target = match self.selected {
                 Some(id) if list.iter().any(|e| e.id == id) => {
@@ -635,7 +666,11 @@ impl App {
                 _ => list.first().cloned(),
             };
             if let Some(entry) = target {
-                self.on_activate(&entry);
+                if ctrl_enter {
+                    self.on_activate_trimmed(&entry);
+                } else {
+                    self.on_activate(&entry);
+                }
             }
         }
     }
@@ -957,7 +992,17 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(egui::RichText::new(created).weak().small());
+                                    // 来源和时间拼成一个 label，而不是两个。
+                                    // 右对齐布局里每多一个元素就多一份 item_spacing，
+                                    // 420px 宽的卡片上这 5px 得省。
+                                    let meta = if entry.app.is_empty() {
+                                        // 老库里的条目没有来源，直接不显示，
+                                        // 不拿「未知」占位——那只是噪音。
+                                        created
+                                    } else {
+                                        format!("{} · {}", truncate_chars(&entry.app, 12), created)
+                                    };
+                                    ui.label(egui::RichText::new(meta).weak().small());
                                 },
                             );
                         });
@@ -1299,12 +1344,28 @@ impl App {
             .map(|t| t.elapsed() < CLEAR_CONFIRM_TTL)
             .unwrap_or(false);
 
+        // 这一栏和列表用同一个面板底色。原先在顶边画过一条发丝线，实际看是
+        // 一道横贯整窗的硬边，比"分不清"更碍眼——去掉，靠上下 6px 留白分隔就够了。
         ui.horizontal(|ui| {
+            // 左右两侧各自成组，中间的间距全由显式 `add_space` 控制：
+            // 键帽和说明之间要 4px、组与组之间要 10px，默认 item_spacing 只能给一个值。
+            ui.spacing_mut().item_spacing.x = 0.0;
+
             // 左侧：操作反馈，没有就显示快捷键提示
             let mut expired = false;
             match &self.toast {
                 Some((msg, t)) if t.elapsed().as_secs() < 3 => {
-                    ui.label(egui::RichText::new(msg).small());
+                    // 前面点一颗强调色圆点：纯灰字在一屏灰字里没有"刚发生了什么"的语义，
+                    // 而这一行本来就窄，加个图标也塞不下。
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.0, theme::ACCENT);
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(theme::FONT_FOOT)
+                            .color(ui.visuals().strong_text_color()),
+                    );
                     // 到期时叫醒一帧，否则空闲不重绘、提示会一直挂着不走。
                     let left = std::time::Duration::from_secs(3) - t.elapsed();
                     ui.ctx().request_repaint_after(left);
@@ -1317,14 +1378,45 @@ impl App {
                         .selected
                         .and_then(|id| self.index.get(id))
                         .map(|e| e.kind);
-                    let hint = match kind {
-                        Some(Kind::Image) => "空格看大图 · Enter 粘贴 · Alt+1~9 直达",
-                        Some(Kind::Text | Kind::RichText) => {
-                            "空格看全文 · Enter 粘贴 · Alt+1~9 直达"
+                    let hint: &[(&str, &str)] = match kind {
+                        Some(Kind::Image) => {
+                            &[("空格", "看大图"), ("Enter", "粘贴"), ("Alt+1~9", "直达")]
                         }
-                        _ => "↑↓ 选择 · Alt+1~9 直达 · Del 删除 · Ctrl+P 收藏",
+                        Some(Kind::Text | Kind::RichText) => {
+                            // 文本类把 `Alt+1~9` 换成 `Ctrl+Enter`：数字直达是
+                            // 熟练后才用的，而"粘出去多一个空行"每天都会发生。
+                            // 一栏只放得下三组，得挑当下的信息量。
+                            &[
+                                ("空格", "看全文"),
+                                ("Enter", "粘贴"),
+                                ("Ctrl+Enter", "去尾空行"),
+                            ]
+                        }
+                        _ => &[
+                            ("↑↓", "选择"),
+                            ("Alt+1~9", "直达"),
+                            ("Del", "删除"),
+                            ("Ctrl+P", "收藏"),
+                        ],
                     };
-                    ui.label(egui::RichText::new(hint).weak().small());
+                    for (i, (key, desc)) in hint.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(theme::GAP_MD + 2.0);
+                        }
+                        keycap(ui, key);
+                        ui.add_space(4.0);
+                        // 说明文字比 `weak_text_color` 再深一点：它是这一栏里
+                        // 唯一的连续阅读内容，纯弱化色在 12px 下会掉出可读范围。
+                        ui.label(
+                            egui::RichText::new(*desc)
+                                .size(theme::FONT_FOOT)
+                                .color(blend(
+                                    ui.visuals().weak_text_color(),
+                                    ui.visuals().text_color(),
+                                    0.45,
+                                )),
+                        );
+                    }
                 }
             }
             if expired {
@@ -1337,8 +1429,7 @@ impl App {
                 } else {
                     "清空历史"
                 };
-                let resp = ui.button(egui::RichText::new(label).small());
-                if resp.clicked() {
+                if footer_button(ui, label, confirming).clicked() {
                     if confirming {
                         self.confirm_clear = None;
                         if self.tx.send(Command::Clear).is_ok() {
@@ -1403,8 +1494,27 @@ impl eframe::App for App {
             win::hide_main_window();
         }
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| self.ui_header(ui));
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| self.ui_footer(ui));
+        // `show_separator_line(false)`：egui 的面板默认会在自己的边缘画一条
+        // `bg_stroke` 分隔线，和有没有 `frame` 无关。底栏那条横贯整窗、贴在
+        // 快捷键上方 6px 处，像条多余的横线——而顶栏本来就有显式的 `ui.separator()`，
+        // 两条叠着反而更粗。两边都关掉，线只由内容自己画。
+        egui::TopBottomPanel::top("header")
+            .show_separator_line(false)
+            .show(ctx, |ui| self.ui_header(ui));
+        // 底部栏高度写死：键帽和按钮都是 `KEY_H` 高，居中需要上下各留 6px；
+        // 靠内容撑高的话每种状态高度都不一样，窗口会跟着抖。
+        egui::TopBottomPanel::bottom("footer")
+            .exact_height(theme::FOOTER_H)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                    left: theme::FOOTER_PAD_X,
+                    right: theme::FOOTER_PAD_X,
+                    top: 6,
+                    bottom: 6,
+                }),
+            )
+            .show(ctx, |ui| self.ui_footer(ui));
         egui::CentralPanel::default().show(ctx, |ui| {
             self.ui_list(ui);
             self.ui_preview(ui);
@@ -1530,8 +1640,90 @@ fn filter_chip(
     resp.clicked()
 }
 
-/// 构造带命中高亮的预览文本。
+/// 一个「键帽」：淡底 + 一圈发丝边 + 12px 字。
 ///
+/// 底部快捷键原先是整行灰字，11px 弱化色贴在窗口最下沿，几乎看不清哪个键
+/// 对应哪句话。拆成键帽之后每个按键有自己的边界，扫一眼就能对上是哪个键；
+/// 而且它和筛选 chip 共用「淡底 + 描边」这套语言，不像另一种风格硬拼进来的。
+///
+/// 高度和字号都与 `footer_button` 对齐（`KEY_H` + `FONT_FOOT`），两者才能
+/// 落在同一条视觉基线上。
+///
+/// 颜色从 `text_color()` 推：浅色主题下文字近黑，淡黑底正好是浅灰卡片；
+/// 深色主题下文字近白，同一段代码给出的是浅色浮起块。不写死 RGB。
+fn keycap(ui: &mut egui::Ui, key: &str) -> egui::Response {
+    let color = ui.visuals().text_color();
+    let font = egui::FontId::new(theme::FONT_FOOT, egui::FontFamily::Proportional);
+    let galley = ui.painter().layout_no_wrap(key.to_owned(), font, color);
+    let size = egui::vec2(
+        galley.size().x.ceil() + theme::KEY_PAD_X * 2.0,
+        theme::KEY_H,
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, theme::RADIUS_SM, theme::wash(color, 30));
+    painter.rect_stroke(
+        rect,
+        theme::RADIUS_SM,
+        egui::Stroke::new(1.0, theme::wash(color, 52)),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.center() - galley.size() * 0.5, galley, color);
+    resp
+}
+
+/// 底部状态栏的按钮（目前只有「清空历史」）。
+///
+/// 不用 `ui.button`：默认按钮是实心填充，在这一条 32px 的窄带里像一块补丁。
+/// 平时只给描边（ghost），hover 才浮起，确认态直接切成实心 `DANGER`——
+/// 破坏性操作在按下之前就该换一副面孔，而不是等按完再说。
+fn footer_button(ui: &mut egui::Ui, label: &str, confirming: bool) -> egui::Response {
+    // 先量字、再占位、最后按 hover 上色：按钮尺寸由文字决定，颜色却要等
+    // 交互结果才知道。用 `PLACEHOLDER` 排版 + 绘制时覆盖颜色绕开这个顺序。
+    let font = egui::FontId::new(theme::FONT_FOOT, egui::FontFamily::Proportional);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER);
+    let size = egui::vec2(galley.size().x.ceil() + 20.0, theme::KEY_H);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    let hover = ui.ctx().animate_bool_with_time(
+        ui.make_persistent_id("footer-btn"),
+        resp.hovered() && !confirming,
+        theme::ANIM_FAST,
+    );
+    let text = ui.visuals().text_color();
+    let (fill, stroke, color) = if confirming {
+        (theme::DANGER, egui::Stroke::NONE, egui::Color32::WHITE)
+    } else {
+        (
+            theme::wash(theme::DANGER, (20.0 * hover) as u8),
+            egui::Stroke::new(
+                1.0,
+                blend(
+                    theme::wash(text, 46),
+                    theme::wash(theme::DANGER, 110),
+                    hover,
+                ),
+            ),
+            blend(ui.visuals().weak_text_color(), theme::DANGER, hover),
+        )
+    };
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, theme::RADIUS_SM, fill);
+    if stroke != egui::Stroke::NONE {
+        painter.rect_stroke(rect, theme::RADIUS_SM, stroke, egui::StrokeKind::Inside);
+    }
+    painter.galley_with_override_text_color(rect.center() - galley.size() * 0.5, galley, color);
+
+    if resp.hovered() {
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 /// 列表里的预览行：等宽字体、最多 `PREVIEW_ROWS` 行、超出用省略号收尾。
 ///
 /// 用 `LayoutJob` 而不是给 `RichText` 加样式，有两个原因：
@@ -1813,6 +2005,29 @@ fn fmt_time(ms: i64) -> String {
     }
 }
 
+/// 把库里的 payload 转成「写回剪贴板用」的字节。
+///
+/// 单独拎成自由函数是为了能直接测：这是全流程里**唯一会改动用户内容**的地方，
+/// 裁错一个字就是把用户复制的东西弄坏了，必须有测试兜着。
+///
+/// 文本往返一次 CRLF（存的时候归一成 LF，写回时换回来），因此这里对原始
+/// payload 做的是「归一化状态下的裁剪 + denormalize」，两步顺序不能换。
+fn paste_payload(kind: Kind, payload: Vec<u8>, mode: PasteMode) -> Vec<u8> {
+    match kind {
+        Kind::Text | Kind::RichText => {
+            let text = String::from_utf8_lossy(&payload);
+            let text = match mode {
+                // 只裁尾部：开头的缩进是内容的一部分（代码、YAML、引用的邮件），
+                // 动了就废了。尾部空白则几乎总是「复制时顺带扫进来的」。
+                PasteMode::Trimmed => text.trim_end().to_owned(),
+                PasteMode::Raw => text.into_owned(),
+            };
+            denormalize_newlines(&text).into_bytes()
+        }
+        _ => payload,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1962,5 +2177,41 @@ mod tests {
         assert_eq!(shown, "一段短文本");
         assert!(!skipped && !truncated);
         assert_eq!(hit, Some("一段".len()), "字节偏移，不是字符序号");
+    }
+
+    #[test]
+    fn trimmed_paste_drops_trailing_blank_lines() {
+        // 从终端复制命令的典型形态：一条命令 + 两个换行。
+        // 不裁的话粘回终端会立刻执行，粘进聊天框会多出空行。
+        let raw = b"git status --short\n\n".to_vec();
+        let out = paste_payload(Kind::Text, raw, PasteMode::Trimmed);
+        assert_eq!(String::from_utf8(out).unwrap(), "git status --short");
+    }
+
+    #[test]
+    fn trimmed_paste_keeps_leading_indent() {
+        // 缩进是内容本身：YAML、Python、引用的邮件全依赖它。
+        let raw = b"  key: value\n  other: value\n\n".to_vec();
+        let out = paste_payload(Kind::Text, raw, PasteMode::Trimmed);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "  key: value\r\n  other: value",
+            "只裁尾部，且换行换成 CRLF"
+        );
+    }
+
+    #[test]
+    fn raw_paste_keeps_everything() {
+        let raw = b"line\n\n".to_vec();
+        let out = paste_payload(Kind::Text, raw, PasteMode::Raw);
+        assert_eq!(String::from_utf8(out).unwrap(), "line\r\n\r\n");
+    }
+
+    #[test]
+    fn trimmed_paste_leaves_binary_untouched() {
+        // 图片和文件不该被当文本处理，否则 payload 直接被改写坏掉。
+        let png = vec![0x89, b'P', b'N', b'G', 0x00, 0x0a, 0x1a, 0x0a];
+        let out = paste_payload(Kind::Image, png.clone(), PasteMode::Trimmed);
+        assert_eq!(out, png);
     }
 }

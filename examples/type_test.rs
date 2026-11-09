@@ -225,7 +225,14 @@ fn click_at(x: i32, y: i32) {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut all: Vec<String> = std::env::args().skip(1).collect();
+    // `--no-show`：窗口已经由别的工具（`focus_click`）点到前台，这里别再
+    // 调 `show_at_cursor`——从后台进程唤起依然会被前台锁挡住，反而把刚拿到的
+    // 前台弄丢，于是每次都被下面那道检查拦下。
+    let no_show = all.iter().any(|a| a == "--no-show");
+    all.retain(|a| a != "--no-show");
+
+    let mut args = all.into_iter();
     let first = args.next().unwrap_or_else(|| "文件".to_string());
 
     let Some(hwnd) = window::main_window() else {
@@ -233,11 +240,13 @@ fn main() {
         std::process::exit(1);
     };
 
-    // 唤出窗口，内部会把焦点交给搜索框。
-    // 等久一点：焦点是异步落定的（Win32 激活 + egui 下一帧才把焦点给输入框），
-    // 太急会丢掉第一个字符，看起来像搜索框没响应。
-    window::show_at_cursor();
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    if !no_show {
+        // 唤出窗口，内部会把焦点交给搜索框。
+        // 等久一点：焦点是异步落定的（Win32 激活 + egui 下一帧才把焦点给输入框），
+        // 太急会丢掉第一个字符，看起来像搜索框没响应。
+        window::show_at_cursor();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 
     // 确认前台真的是我们，否则按键会打到别的程序上
     let fg = unsafe { GetForegroundWindow() };

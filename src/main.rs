@@ -60,8 +60,8 @@ fn run() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("rpaste-dispatch".into())
         .spawn(move || {
-            for seq in events {
-                if cmd_tx_listener.send(capture::Command::Seq(seq)).is_err() {
+            for ev in events {
+                if cmd_tx_listener.send(capture::Command::Seq(ev)).is_err() {
                     break;
                 }
                 // 提示 UI 有新内容。容量 1，UI 每帧合并消费即可。

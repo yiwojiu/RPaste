@@ -23,7 +23,7 @@ use crate::model::{Captured, INLINE_LIMIT, Kind, PREVIEW_CHARS, TAIL_CHARS};
 /// 有了它，「这次启动要不要补数据」才有一个确定的判据。只靠
 /// `WHERE tail = ''` 判断的话，每次启动都会把那些「短但字节多」的汉字条目
 /// 重新读一遍 payload，白花时间。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
@@ -44,6 +44,11 @@ pub struct EntryMeta {
     /// 收藏的条目不会被容量淘汰。值本身不参与排序——列表始终按时间倒序，
     /// 收藏项就留在它本来该在的位置上，翻起来才有可预测的顺序。
     pub pinned: bool,
+    /// 复制时的前台程序名（`Chrome` / `终端` / …）。空串表示没抓到。
+    ///
+    /// 老库里这一列是后加的，历史条目全部是空串——没有来源不等于来源未知，
+    /// UI 上直接不显示，不要占位。
+    pub app: String,
 }
 
 /// 历史条目上限。超过就按最旧优先淘汰。
@@ -65,7 +70,7 @@ pub struct ReadStore {
 impl ReadStore {
     pub fn recent(&self, limit: usize) -> Result<Vec<EntryMeta>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, kind, preview, byte_len, created_at, hit_count, pinned
+            "SELECT id, kind, preview, byte_len, created_at, hit_count, pinned, app
              FROM clips ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -77,6 +82,7 @@ impl ReadStore {
                 created_at: r.get(4)?,
                 hit_count: r.get(5)?,
                 pinned: r.get::<_, i64>(6)? != 0,
+                app: r.get(7)?,
             })
         })?;
 
@@ -129,7 +135,7 @@ impl ReadStore {
     /// 1 万条约 10–20 ms，不放在搜索路径上。
     pub fn all_meta(&self) -> Result<Vec<EntryMeta>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, kind, preview, byte_len, created_at, hit_count, pinned
+            "SELECT id, kind, preview, byte_len, created_at, hit_count, pinned, app
              FROM clips ORDER BY created_at DESC",
         )?;
         collect_meta(&mut stmt, &[])
@@ -168,7 +174,7 @@ impl ReadStore {
     /// 「比 created_at」可靠——改时间戳的 bump 不影响 id。
     pub fn meta_since(&self, after_id: i64) -> Result<Vec<EntryMeta>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, kind, preview, byte_len, created_at, hit_count, pinned
+            "SELECT id, kind, preview, byte_len, created_at, hit_count, pinned, app
              FROM clips WHERE id > ?1 ORDER BY created_at DESC",
         )?;
         collect_meta(&mut stmt, params![after_id])
@@ -176,7 +182,7 @@ impl ReadStore {
 }
 
 /// 把 `clips` 的行映射成 `EntryMeta`。列顺序固定为
-/// `id, kind, preview, byte_len, created_at, hit_count, pinned`。
+/// `id, kind, preview, byte_len, created_at, hit_count, pinned, app`。
 fn collect_meta(
     stmt: &mut rusqlite::Statement<'_>,
     p: &[&dyn rusqlite::ToSql],
@@ -192,6 +198,7 @@ fn collect_meta(
             created_at: row.get(4)?,
             hit_count: row.get(5)?,
             pinned: row.get::<_, i64>(6)? != 0,
+            app: row.get(7)?,
         });
     }
     Ok(out)
@@ -267,7 +274,8 @@ impl Store {
                  inline     BLOB,
                  blob_path  TEXT,
                  created_at INTEGER NOT NULL,
-                 hit_count  INTEGER NOT NULL DEFAULT 0
+                 hit_count  INTEGER NOT NULL DEFAULT 0,
+                 app        TEXT    NOT NULL DEFAULT ''
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_hash ON clips(hash);
              CREATE INDEX IF NOT EXISTS idx_clips_recent ON clips(created_at DESC);",
@@ -283,6 +291,12 @@ impl Store {
         // `tail`（v2）：预览之外的正文尾部，专给检索用。
         // 以前只有 512 字预览，长文本的后半段搜不到——复制过的东西搜不出来
         // 是最伤信任的一类缺陷，宁可多存一份尾部。
+        // `app`（v3）：复制时的来源程序名。同样后加，老数据留空。
+        if !self.has_column("clips", "app")? {
+            self.conn
+                .execute_batch("ALTER TABLE clips ADD COLUMN app TEXT NOT NULL DEFAULT '';")?;
+        }
+
         if !self.has_column("clips", "tail")? {
             self.conn
                 .execute_batch("ALTER TABLE clips ADD COLUMN tail TEXT NOT NULL DEFAULT '';")?;
@@ -382,10 +396,20 @@ impl Store {
 
         // 先查后写：单写入者场景下没有竞态，比 ON CONFLICT 更省一次 blob 落盘。
         if let Some(id) = self.find_by_hash(&c.hash)? {
-            self.conn.execute(
-                "UPDATE clips SET created_at = ?1, hit_count = hit_count + 1 WHERE id = ?2",
-                params![now, id],
-            )?;
+            // 来源跟着更新：用户看到的是「这条最近一次是从哪儿复制的」。
+            // 抓不到来源的那次保留旧值——不能因为偶尔查询失败就把已知来源抹掉。
+            if c.app.is_empty() {
+                self.conn.execute(
+                    "UPDATE clips SET created_at = ?1, hit_count = hit_count + 1 WHERE id = ?2",
+                    params![now, id],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE clips SET created_at = ?1, hit_count = hit_count + 1, app = ?3
+                     WHERE id = ?2",
+                    params![now, id, c.app],
+                )?;
+            }
             return Ok(InsertOutcome::Bumped(id));
         }
 
@@ -396,8 +420,9 @@ impl Store {
         };
 
         self.conn.execute(
-            "INSERT INTO clips (kind, hash, preview, tail, byte_len, inline, blob_path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO clips
+                 (kind, hash, preview, tail, byte_len, inline, blob_path, created_at, app)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 c.kind.as_i64(),
                 &c.hash[..],
@@ -406,7 +431,8 @@ impl Store {
                 c.payload.len() as i64,
                 inline,
                 blob_path,
-                now
+                now,
+                c.app
             ],
         )?;
 

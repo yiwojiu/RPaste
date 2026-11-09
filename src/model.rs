@@ -68,6 +68,11 @@ pub struct Captured {
     pub preview: String,
     /// 预览之外的正文尾部，只用于检索。没有尾部时是空串。
     pub tail: String,
+    /// 复制时的前台程序名，例如 `Chrome`。取不到就是空串。
+    ///
+    /// 由监听线程在 `WM_CLIPBOARDUPDATE` 那一刻抓取后补进来（见 `win::appinfo`），
+    /// 所以读取线程构造出 `Captured` 时这里还是空的。
+    pub app: String,
 }
 
 impl Captured {
@@ -79,7 +84,14 @@ impl Captured {
             payload,
             preview,
             tail: String::new(),
+            app: String::new(),
         }
+    }
+
+    /// 带上来源程序名。空串表示没抓到（保护进程、时机没对上等）。
+    pub fn with_app(mut self, app: String) -> Self {
+        self.app = app;
+        self
     }
 
     /// 带上检索用的正文尾部。文本之外的类型不需要（预览已经覆盖了全部信息）。

@@ -41,13 +41,13 @@ pub fn set_cmd_tx(tx: crossbeam_channel::Sender<crate::capture::Command>) {
     let _ = CMD_TX.set(tx);
 }
 
-static SEQ_TX: OnceLock<SyncSender<u32>> = OnceLock::new();
+static SEQ_TX: OnceLock<SyncSender<crate::capture::ClipEvent>> = OnceLock::new();
 
-/// 启动监听线程，返回剪贴板序列号流。
+/// 启动监听线程，返回剪贴板变更流。
 ///
 /// 热键注册失败（例如被占用）不会让程序退出，只是打印警告：
 /// 剪贴板捕获照常工作，只是没有快捷键呼出。
-pub fn spawn() -> Receiver<u32> {
+pub fn spawn() -> Receiver<crate::capture::ClipEvent> {
     let (seq_tx, seq_rx) = sync_channel(1);
     let _ = SEQ_TX.set(seq_tx);
 
@@ -174,7 +174,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         WM_CLIPBOARDUPDATE => {
             let seq = unsafe { GetClipboardSequenceNumber() };
             if let Some(tx) = SEQ_TX.get() {
-                let _ = tx.try_send(seq);
+                // 来源必须在这里抓：此刻前台还停在用户按下 Ctrl+C 的那个程序上。
+                // 等事件转到 worker 再问就不准了——中间可能切了窗口。
+                let app = super::appinfo::foreground_app();
+                let _ = tx.try_send(crate::capture::ClipEvent { seq, app });
             }
             0
         }

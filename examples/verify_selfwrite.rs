@@ -66,7 +66,8 @@ fn main() {
     let mut seq = lo;
     while seq != hi {
         seq = seq.wrapping_add(1);
-        tx.send(Command::Seq(seq)).expect("发送 Seq 失败");
+        tx.send(Command::Seq(capture::ClipEvent { seq, app: None }))
+            .expect("发送 Seq 失败");
     }
     std::thread::sleep(Duration::from_millis(700));
 
@@ -87,7 +88,11 @@ fn main() {
     // --- 2. 区间之外的真实复制：必须照常入库 ---
     assert!(clipboard::write_text("R-Paste 自激抑制验证 OK"));
     let seq2 = clipboard::sequence_number();
-    tx.send(Command::Seq(seq2)).expect("发送 Seq 失败");
+    tx.send(Command::Seq(capture::ClipEvent {
+        seq: seq2,
+        app: None,
+    }))
+    .expect("发送 Seq 失败");
     std::thread::sleep(Duration::from_millis(700));
 
     let total2 = read.total().expect("计数失败");

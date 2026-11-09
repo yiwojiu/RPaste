@@ -581,6 +581,7 @@ mod tests {
             created_at,
             hit_count: 0,
             pinned: false,
+            app: String::new(),
         }
     }
 

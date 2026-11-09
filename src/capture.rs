@@ -27,6 +27,16 @@ const READ_TIMEOUT: Duration = Duration::from_millis(400);
 /// 时长不可靠——短了数据没落盘，长了白等。
 pub static WORKER_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 监听线程递过来的一次剪贴板变更。
+///
+/// 序列号和来源程序**必须一起送达**：来源只能靠「事件到达那一刻的前台窗口」
+/// 推断，晚一步去问就可能问到别的窗口。
+pub struct ClipEvent {
+    pub seq: u32,
+    /// 复制时的前台程序名。保护进程或时机不对时为 `None`。
+    pub app: Option<String>,
+}
+
 /// UI 要求把一条历史写回剪贴板。
 pub struct CopyRequest {
     pub kind: crate::model::Kind,
@@ -38,8 +48,8 @@ pub struct CopyRequest {
 
 /// UI 发给 worker 的命令。
 pub enum Command {
-    /// 捕获事件，携带系统剪贴板序列号。
-    Seq(u32),
+    /// 捕获事件，携带系统剪贴板序列号和来源程序。
+    Seq(ClipEvent),
     /// 写回剪贴板，可选地在写完后自动粘贴。
     Copy(CopyRequest),
     /// 删除一条历史。
@@ -74,7 +84,7 @@ pub fn run(rx: Receiver<Command>, store: Store, notify: crossbeam_channel::Sende
 
     for cmd in rx {
         match cmd {
-            Command::Seq(seq) => cap.handle(seq),
+            Command::Seq(ev) => cap.handle(ev),
             Command::Copy(req) => cap.copy(req),
             Command::Delete(id) => {
                 match cap.store.delete(id) {
@@ -201,7 +211,8 @@ impl Capture {
         }
     }
 
-    fn handle(&mut self, seq: u32) {
+    fn handle(&mut self, ev: ClipEvent) {
+        let seq = ev.seq;
         // 序列号只是单调递增的不透明值，不是拷贝次数。
         // 相同就说明是同一次变更的重复通知。
         if seq == self.last_seq {
@@ -224,6 +235,7 @@ impl Capture {
                         && c.hash != sw.hash
                     {
                         self.stats.events += 1;
+                        let c = apply_app(c, ev.app.as_deref());
                         self.persist(seq, c, Instant::now());
                     }
                 }
@@ -238,7 +250,10 @@ impl Capture {
         self.stats.events += 1;
         let started = Instant::now();
         match read_with_timeout() {
-            Ok(Some(captured)) => self.persist(seq, captured, started),
+            Ok(Some(captured)) => {
+                let captured = apply_app(captured, ev.app.as_deref());
+                self.persist(seq, captured, started);
+            }
             Ok(None) => {
                 self.stats.empty += 1;
                 // 区分「剪贴板为空」和「有内容但没匹配到我们支持的格式」，
@@ -260,10 +275,15 @@ impl Capture {
                 // 只记元信息，不记内容：GUI 子系统没有控制台，而且剪贴板预览
                 // 可能含密码等敏感信息，不该明文落到磁盘上。
                 crate::log_info!(
-                    "seq {seq} 新增 #{id} {} {}B {}us",
+                    "seq {seq} 新增 #{id} {} {}B {}us 来源={}",
                     captured.kind.name(),
                     captured.len(),
-                    elapsed.as_micros()
+                    elapsed.as_micros(),
+                    if captured.app.is_empty() {
+                        "-"
+                    } else {
+                        captured.app.as_str()
+                    }
                 );
             }
             Ok(InsertOutcome::Bumped(_)) => {
@@ -273,6 +293,17 @@ impl Capture {
             Err(err) => crate::log_error!("入库失败: {err:#}"),
         }
     }
+}
+
+/// 把来源程序名补进捕获结果。
+///
+/// 抽成函数是因为落库有两条路径（正常捕获、自己写回区间里夹着的并发复制），
+/// 两边必须用同一个来源——否则会出现「同一次复制在两条路径上记成不同来源」。
+fn apply_app(mut c: Captured, app: Option<&str>) -> Captured {
+    if let Some(app) = app {
+        c.app = app.to_owned();
+    }
+    c
 }
 
 /// `Ok(Some(内容))` / `Ok(None)` 剪贴板为空 / `Err(())` 读超时。

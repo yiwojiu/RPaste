@@ -1,3 +1,4 @@
+pub mod appinfo;
 pub mod autostart;
 pub mod clipboard;
 /// Win+V 接管（低级键盘钩子）——暂时搁置，代码保留。见模块文档。
