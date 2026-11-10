@@ -76,7 +76,7 @@ fn show_at_cursor_inner(remember_target: bool) {
         if GetCursorPos(&mut pt) == 0 {
             // 拿不到光标就退回原来的行为，至少能显示出来
             ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            take_foreground(hwnd);
             return;
         }
 
@@ -140,7 +140,7 @@ fn show_at_cursor_inner(remember_target: bool) {
             SWP_NOSIZE | SWP_SHOWWINDOW
         };
         SetWindowPos(hwnd, HWND_TOP, x, y, win_w, win_h, flags);
-        SetForegroundWindow(hwnd);
+        take_foreground(hwnd);
     }
 }
 
@@ -152,8 +152,8 @@ pub fn show_main_window() {
         } else {
             ShowWindow(hwnd, SW_SHOW);
         }
-        SetForegroundWindow(hwnd);
     }
+    take_foreground(hwnd);
 }
 
 pub fn hide_main_window() {
@@ -316,6 +316,18 @@ fn focus_window(hwnd: HWND) -> bool {
             std::thread::sleep(Duration::from_millis(15));
         }
         false
+    }
+}
+
+/// 唤出窗口后把前台拿过来；拿不到只留一行日志。
+///
+/// **不能只调 `SetForegroundWindow`**：本进程不是前台进程时它会被静默拒绝，
+/// 窗口照样弹出来，但停在**未激活**状态——一是亚克力材质走未激活配色，
+/// 整窗发灰；二是第一下点击会被系统拿去激活窗口，眼前设置里的按钮点不动。
+/// 用户看到的就是「怎么灰了，不让设置」。
+fn take_foreground(hwnd: HWND) {
+    if !focus_window(hwnd) {
+        crate::log_warn!("唤出后未能取得前台焦点，窗口会以未激活样式显示（首击被吞）");
     }
 }
 
