@@ -19,7 +19,7 @@ fn main() {
     let (x, y, w, h) = if nums.len() >= 4 {
         (nums[0], nums[1], nums[2], nums[3])
     } else {
-        unsafe { (0, 0, GetSystemMetricsSafe(0), GetSystemMetricsSafe(1)) }
+        unsafe { (0, 0, get_system_metrics_safe(0), get_system_metrics_safe(1)) }
     };
 
     unsafe {
@@ -77,6 +77,6 @@ fn main() {
 }
 
 /// `SM_CXSCREEN` = 0、`SM_CYSCREEN` = 1。直接写数字，省得再引一个 feature。
-unsafe fn GetSystemMetricsSafe(index: i32) -> i32 {
+unsafe fn get_system_metrics_safe(index: i32) -> i32 {
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(index) }
 }

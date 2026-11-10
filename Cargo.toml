@@ -1,6 +1,6 @@
 [package]
 name = "rpaste"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Windows 剪贴板历史工具：Alt+V 唤出，内存索引搜索，支持文本、图片与文件"
 authors = ["yiwojiu"]
