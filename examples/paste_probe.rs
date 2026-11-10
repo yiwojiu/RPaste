@@ -18,11 +18,12 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
-    MapVirtualKeyW, SendInput, VK_CONTROL, VK_MENU, VK_V,
+    MapVirtualKeyW, SendInput, SetFocus, VK_CONTROL, VK_MENU, VK_V,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    BringWindowToTop, EnumWindows, FindWindowW, GUITHREADINFO, GetClassNameW, GetForegroundWindow,
+    GetGUIThreadInfo, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SW_HIDE, SW_SHOW,
+    SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 
 const MARK: &str = "RPTEST-1762";
@@ -84,14 +85,16 @@ fn main() {
     match mode.as_str() {
         "chars" => type_chars("AB"),
         "vslow" => paste_slow(),
-        // 端到端：先发全局热键唤出 R-Paste，再按 Alt+1 粘贴第一条。
-        // 这条路径会经过「窗口抢前台 → 隐藏 → 还原焦点」的完整流程，
-        // 和双击条目等价。
+        // 完整复现 R-Paste 的粘贴顺序：自己的窗口先占前台 → 让位给目标 →
+        // 隐藏自己 → 等到前台确实回到目标 → 发键。用来验证「是不是这一步
+        // 让目标程序丢了焦点」。
+        "flow" => flow(hwnd),
+        // 走真实入口：全局热键唤出 → Alt+1 粘贴第一条
         "e2e" => {
-            hotkey(&[VK_CONTROL], 0xC0); // Ctrl+`
-            std::thread::sleep(std::time::Duration::from_millis(900));
+            hotkey(&[VK_CONTROL], 0xC0);
+            std::thread::sleep(std::time::Duration::from_millis(1000));
             hotkey(&[VK_MENU], b'1' as u16);
-            std::thread::sleep(std::time::Duration::from_millis(900));
+            std::thread::sleep(std::time::Duration::from_millis(1000));
         }
         _ => paste_burst(),
     }
@@ -195,6 +198,123 @@ fn type_chars(text: &str) {
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
     println!("已注入字符 {text:?}");
+}
+
+/// 把前台切给 `hwnd`。本进程不是前台时 `SetForegroundWindow` 会被系统拒绝，
+/// 需要先挂到当前前台线程的输入队列上。
+fn focus_to(hwnd: HWND) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let fg_thread = if fg.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, ptr::null_mut())
+        };
+        let my = GetCurrentThreadId();
+        let attached =
+            fg_thread != 0 && fg_thread != my && AttachThreadInput(my, fg_thread, 1) != 0;
+        SetForegroundWindow(hwnd);
+        BringWindowToTop(hwnd);
+        if attached {
+            AttachThreadInput(my, fg_thread, 0);
+        }
+    }
+}
+
+/// 打印目标窗口线程的焦点状态。`hwndFocus` 为空说明按键会落到无人接收的地方。
+fn dump_focus(tag: &str, hwnd: HWND) {
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, ptr::null_mut());
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(tid, &mut info) == 0 {
+            println!("{tag} GetGUIThreadInfo 失败");
+            return;
+        }
+        println!(
+            "{tag} hwndFocus={:?} hwndActive={:?} hwndCapture={:?} flags=0x{:x}",
+            info.hwndFocus, info.hwndActive, info.hwndCapture, info.flags
+        );
+    }
+}
+
+/// 复现 R-Paste 的粘贴流程，用来判断「自己抢过前台」是不是丢焦点的原因。
+fn flow(target: HWND) {
+    let title = wide("R-Paste");
+    let main = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
+    if main.is_null() {
+        println!("找不到 R-Paste 主窗口（标题应含 R-Paste）");
+        return;
+    }
+
+    // 1. 模拟热键唤出：窗口可见并占住前台
+    unsafe { ShowWindow(main, SW_SHOW) };
+    focus_to(main);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    dump_focus("唤出后", target);
+
+    // 2. 让位给目标，再隐藏自己 —— R-Paste 的真实顺序
+    focus_to(target);
+    unsafe { ShowWindow(main, SW_HIDE) };
+
+    // 3. 等前台真的回到目标
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        if unsafe { GetForegroundWindow() } == target {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    dump_focus("让位后", target);
+
+    // 4a. 先观察：不主动干预，看焦点会不会自己回来、要多久
+    let t0 = std::time::Instant::now();
+    loop {
+        if !focus_hwnd(target).is_null() {
+            break;
+        }
+        if t0.elapsed() > std::time::Duration::from_millis(2000) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    println!("焦点自行恢复耗时 {:?}（0 表示一直没回来）", t0.elapsed());
+    dump_focus("等待后", target);
+
+    // 4b. 焦点为空就主动按进去，再等缓冲，然后发键
+    unsafe {
+        let tid = GetWindowThreadProcessId(target, ptr::null_mut());
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(tid, &mut info) != 0 && info.hwndFocus.is_null() {
+            let my = GetCurrentThreadId();
+            let att = AttachThreadInput(my, tid, 1) != 0;
+            SetFocus(target);
+            if att {
+                AttachThreadInput(my, tid, 0);
+            }
+            println!("焦点为空，已 SetFocus");
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(180));
+    dump_focus("发键前", target);
+    paste_burst();
+}
+
+fn focus_hwnd(hwnd: HWND) -> HWND {
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, ptr::null_mut());
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(tid, &mut info) == 0 {
+            return ptr::null_mut();
+        }
+        info.hwndFocus
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn key(vk: u16, up: bool) -> INPUT {

@@ -22,22 +22,24 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_V,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, FindWindowW, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HWND_TOP, IsIconic,
-    IsWindowVisible, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, WM_PAINT, WS_EX_LAYERED,
+    BringWindowToTop, FindWindowW, GUITHREADINFO, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindowVisible, PostMessageW, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    WM_PAINT, WS_EX_LAYERED,
 };
 
 /// eframe 主窗口的标题，`main.rs` 里 `with_title` 设的就是它。
 /// listener 用的隐藏窗口标题是 `RPasteClipboardListener`，不会撞。
 const MAIN_TITLE: &str = "R-Paste";
 
-/// 窗口重新拿到前台之后，等多久才发粘贴按键。
+/// 等目标线程交出输入焦点的上限。
 ///
-/// 60ms 在记事本、Chrome 这类程序上够用，但钉钉（Qt 5.15）会静默丢掉早到的
-/// 按键：它从失活回到激活时，焦点要等事件循环转一圈才还给输入框。手按
-/// Ctrl+V 能粘、自动粘贴没反应，差的就是这段时间。
-const PASTE_SETTLE: Duration = Duration::from_millis(180);
+/// 实测钉钉（Qt 5.15）在重新激活后约 530ms 才把焦点还给输入框，留一倍余量。
+const FOCUS_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// 焦点出现后再等一小会儿：它先落到顶层窗口，再交给输入框子窗口。
+const FOCUS_SETTLE: Duration = Duration::from_millis(80);
 
 /// 唤出前的前台窗口。双击粘贴时要还给它。
 static PREV_FOREGROUND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
@@ -367,10 +369,19 @@ pub fn paste_to_previous() -> bool {
         let _ = focus_window(target);
     }
 
-    // 拿到前台 ≠ 能接收字符。钉钉（Qt）这类程序从失活回到激活时，焦点是异步
-    // 还给输入框的：按键到得早会被静默丢掉，表现就是「手动 Ctrl+V 能粘、
-    // 自动粘贴毫无反应」。这里必须留出缓冲。
-    std::thread::sleep(PASTE_SETTLE);
+    // 拿到前台 ≠ 能接收按键。真正决定按键会不会被丢弃的是**窗口线程有没有
+    // 焦点窗口**：Qt 程序（钉钉）失活时会把焦点清掉，重新激活后要 500ms
+    // 左右才异步还回来。早发的 Ctrl+V 落在空焦点上，被静默丢弃——这正是
+    // 「手动按能粘、自动粘贴没反应」的原因。
+    //
+    // 所以这里按状态等而不是按时间等：记事本、Chrome 这类通常 10~20ms 就有
+    // 焦点，不会因此变慢；只有真的慢的程序才会等到它准备好。
+    let focus_started = std::time::Instant::now();
+    let focused = wait_input_focus(target, FOCUS_TIMEOUT);
+    let focus_ms = focus_started.elapsed().as_millis();
+
+    // 焦点先给顶层窗口、再给输入框子窗口，多留一点让它落定。
+    std::thread::sleep(FOCUS_SETTLE);
 
     // 焦点不对就别乱发按键，否则会打到别的窗口上
     let now = unsafe { GetForegroundWindow() };
@@ -382,17 +393,50 @@ pub fn paste_to_previous() -> bool {
         );
         return false;
     }
+    if !focused {
+        // 没等到焦点也照发：有些程序本来就只在顶层窗口上处理按键，
+        // 与其直接放弃，不如试一次，失败了用户还能手动 Ctrl+V。
+        crate::log_warn!(
+            "等待 {focus_ms}ms 仍未等到目标线程的输入焦点：{}",
+            describe(target)
+        );
+    }
 
     let ok = send_ctrl_v();
     // 这条日志是排查「在某些程序里粘不上」的第一手材料：`ok=true` 说明按键
     // 确实投递出去了，那就是对方程序自己忽略了注入的按键（它可能只认扫描码、
     // 或者要求窗口先进入特定状态），而不是我们这边没发。
     crate::log_info!(
-        "粘贴 Ctrl+V → {}（{}ms，投递={ok}）",
+        "粘贴 Ctrl+V → {}（{}ms，等焦点 {focus_ms}ms，投递={ok}）",
         describe(target),
         started.elapsed().as_millis()
     );
     ok
+}
+
+/// 等目标窗口所在线程拿到输入焦点（`hwndFocus` 非空）。
+///
+/// `GetForegroundWindow` 只说「这个窗口在最前」，不说「按键会进到它」。
+/// 没有焦点窗口的线程收到键盘消息会直接丢弃，而焦点什么时候回来完全由
+/// 对方程序决定（Qt 程序实测 ~530ms，且先给顶层窗口、再给输入框子窗口）。
+fn wait_input_focus(target: HWND, timeout: Duration) -> bool {
+    let tid = unsafe { GetWindowThreadProcessId(target, ptr::null_mut()) };
+    if tid == 0 {
+        return false;
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut info: GUITHREADINFO = unsafe { zeroed() };
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if unsafe { GetGUIThreadInfo(tid, &mut info) } != 0 && !info.hwndFocus.is_null() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// 轮询等待前台变成 `target`。命中返回 true，超时返回 false。
