@@ -129,6 +129,13 @@ const CLEAR_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(3)
 /// 一个值的话，「恢复默认」会跳到一个用户从没见过的大小。
 pub const DEFAULT_WINDOW: (f32, f32) = (420.0, 560.0);
 
+/// 设置面板里可选的保存上限。
+///
+/// 只给几档而不是让用户随手填数：条目上限直接决定删多少数据，填错一位
+/// 就是十倍差距。这几档覆盖「只想留最近的」到「留够半年」，也都能一眼
+/// 估出磁盘量级（纯文本约 1 万条十几 MB，图片视截图而定）。
+const LIMIT_CHOICES: [i64; 4] = [1_000, 3_000, 10_000, 30_000];
+
 /// `Alt+1..9` 对应的数字键，顺序即「列表第几条」。
 const QUICK_PASTE_KEYS: [egui::Key; 9] = [
     egui::Key::Num1,
@@ -230,6 +237,8 @@ pub struct App {
     setting_note: Option<(String, bool)>,
     /// 当前生效的呼出热键。启动时读一次注册表，改键成功后同步更新。
     hotkey: Hotkey,
+    /// 当前生效的历史条目上限。改完立刻写注册表并通知 worker 淘汰。
+    max_entries: i64,
     /// 上一次落盘的窗口尺寸，用来判断「用户还在拖」还是「已经停手」。
     size_saved: (u32, u32),
     /// 正在等待落盘的尺寸：`(尺寸, 这个尺寸第一次出现的时刻)`。
@@ -295,6 +304,7 @@ impl App {
             recording: false,
             setting_note: None,
             hotkey: Hotkey::load(),
+            max_entries: win::settings::max_entries(),
             size_saved: (0, 0),
             size_pending: None,
         };
@@ -568,6 +578,7 @@ impl App {
         self.recording = false;
         self.setting_note = None;
         self.hotkey = Hotkey::load();
+        self.max_entries = win::settings::max_entries();
     }
 
     /// 搜索词一变就丢掉选中项。
@@ -843,6 +854,7 @@ impl App {
         let mut start_recording = false;
         let mut reset_hotkey = false;
         let mut reset_size = false;
+        let mut new_limit: Option<i64> = None;
 
         egui::Window::new("settings-card")
             .title_bar(false)
@@ -949,6 +961,40 @@ impl App {
                 ui.add_space(theme::GAP_XS);
                 hint_label(ui, "拖动窗口边缘即可调整，下次打开按这个尺寸恢复。");
 
+                // ---- 保存上限
+                ui.add_space(theme::GAP_LG);
+                ui.separator();
+                ui.add_space(theme::GAP_MD);
+                section_label(ui, "保存上限");
+                ui.add_space(theme::GAP_SM);
+                ui.horizontal(|ui| {
+                    for value in LIMIT_CHOICES {
+                        // 选中的那颗做实心，其余描边——一排按钮里要能一眼看出
+                        // 现在用的是哪个，否则只能去读下面那行小字。
+                        let selected = self.max_entries == value;
+                        if ghost_button(
+                            ui,
+                            egui::Id::new(("limit", value)),
+                            &thousands(value),
+                            theme::ACCENT,
+                            selected,
+                        )
+                        .clicked()
+                            && !selected
+                        {
+                            new_limit = Some(value);
+                        }
+                    }
+                });
+                ui.add_space(theme::GAP_XS);
+                hint_label(
+                    ui,
+                    &format!(
+                        "最多保存 {} 条，超出按最旧优先淘汰，收藏项保留。",
+                        thousands(self.max_entries)
+                    ),
+                );
+
                 // ---- 一次性反馈（改键成功 / 被占用）
                 if let Some((note, ok)) = &self.setting_note {
                     ui.add_space(theme::GAP_MD);
@@ -998,6 +1044,21 @@ impl App {
             // 会把新尺寸写回去，记忆自然跟上。
             let (w, h) = DEFAULT_WINDOW;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+        }
+        if let Some(limit) = new_limit {
+            // 先落注册表再通知 worker：worker 才是真正删数据的一方，
+            // 注册表写失败就当场报错、不改内存里的值，避免「面板说 1000、
+            // 实际还是 30000」这种自相矛盾。
+            match win::settings::set_max_entries(limit) {
+                Ok(()) => {
+                    self.max_entries = limit;
+                    if self.tx.send(Command::SetLimit(limit)).is_err() {
+                        crate::log_warn!("调整保存上限：worker 已退出，本次只在下次启动生效");
+                    }
+                    self.setting_note = Some((format!("已改为最多 {} 条", thousands(limit)), true));
+                }
+                Err(err) => self.setting_note = Some((err, false)),
+            }
         }
         if close || clicked_outside {
             self.close_settings();
@@ -2373,6 +2434,23 @@ fn human_size(n: i64) -> String {
     } else {
         format!("{n} B")
     }
+}
+
+/// `12345` → `12 345`。上限动辄五位数，不加分隔用户得数位数才能分清
+/// 1 000 和 10 000。用空格而不是逗号：中文界面里逗号容易被读成句读。
+fn thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// 数一下文件条目的路径列表里有多少个已经不存在了。

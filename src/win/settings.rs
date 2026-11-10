@@ -21,9 +21,21 @@ const VALUE_HOTKEY_VK: &str = "HotkeyVk";
 /// 上次关闭时的窗口逻辑尺寸（像素）。两个值分开存，缺一个就当没存过。
 const VALUE_WINDOW_W: &str = "WindowWidth";
 const VALUE_WINDOW_H: &str = "WindowHeight";
+/// 历史条目上限。0 或缺省时用 `DEFAULT_MAX_ENTRIES`。
+const VALUE_MAX_ENTRIES: &str = "MaxEntries";
 
 /// 默认热键 `Alt+V`，与 `hotkey::Hotkey::DEFAULT` 保持一致。
 const DEFAULT_HOTKEY: (u32, u32) = (1, 0x56);
+
+/// 默认条目上限，与 `store::DEFAULT_MAX_ENTRIES` 保持一致。
+const DEFAULT_MAX_ENTRIES: i64 = crate::store::DEFAULT_MAX_ENTRIES;
+
+/// 允许设置的条目上限区间。
+///
+/// 下限 100：再小会变成「刚复制几条就被删」，用户只会觉得程序坏了。
+/// 上限 20 万：纯文本场景约几百 MB，还能接受；图片场景早就爆了，那是
+/// 用户自己的选择，但得先做出「占用可见」才谈得上更放开（目前没有）。
+pub const MAX_ENTRIES_RANGE: (i64, i64) = (100, 200_000);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -138,4 +150,21 @@ pub fn window_size() -> Option<(u32, u32)> {
 pub fn set_window_size(w: u32, h: u32) -> Result<(), String> {
     write_dword(VALUE_WINDOW_W, w)?;
     write_dword(VALUE_WINDOW_H, h)
+}
+
+/// 历史条目上限。
+///
+/// 读到的值超出 `MAX_ENTRIES_RANGE` 时夹到边界，而不是拒绝——用户手改注册表
+/// 填了 999999 说明他想要「尽量多」，给 20 万比给默认 1 万更贴近意图；
+/// 填 0 则是笔误或者想「不限」，夹到 100 条至少不会一条不剩。
+pub fn max_entries() -> i64 {
+    let value = read_dword(VALUE_MAX_ENTRIES)
+        .map(|v| v as i64)
+        .unwrap_or(DEFAULT_MAX_ENTRIES);
+    value.clamp(MAX_ENTRIES_RANGE.0, MAX_ENTRIES_RANGE.1)
+}
+
+pub fn set_max_entries(n: i64) -> Result<(), String> {
+    let n = n.clamp(MAX_ENTRIES_RANGE.0, MAX_ENTRIES_RANGE.1);
+    write_dword(VALUE_MAX_ENTRIES, n as u32)
 }

@@ -44,7 +44,17 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let store = store::Store::open(&root)?;
+    let mut store = store::Store::open(&root)?;
+
+    // 上限存在注册表里，启动时套用一次：上次把上限调小之后进程就退了，
+    // 那批「应该被淘汰」的条目还没删，不在这里补一刀就会一直留着。
+    let limit = win::settings::max_entries();
+    match store.set_max_entries(limit) {
+        Ok(0) => {}
+        Ok(n) => rpaste::log_info!("按保存上限 {limit} 条淘汰 {n} 条旧记录"),
+        Err(e) => rpaste::log_warn!("启动时应用保存上限失败（不影响使用）: {e:#}"),
+    }
+
     let read = store.read_only()?;
 
     // worker 与 UI 之间的命令 / 通知通道。

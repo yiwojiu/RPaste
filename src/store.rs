@@ -51,15 +51,18 @@ pub struct EntryMeta {
     pub app: String,
 }
 
-/// 历史条目上限。超过就按最旧优先淘汰。
+/// 历史条目默认上限。超过就按最旧优先淘汰。
 ///
 /// 剪贴板工具是常驻的，不设上限迟早把磁盘吃满——尤其是图片，
-/// 几次 4K 截图就是几十 MB。
-const MAX_ENTRIES: i64 = 10_000;
+/// 几次 4K 截图就是几十 MB。用户可以在设置面板里改（`win::settings`）。
+pub const DEFAULT_MAX_ENTRIES: i64 = 10_000;
 
 pub struct Store {
     conn: Connection,
     blob_dir: PathBuf,
+    /// 当前生效的条目上限。放在这里而不是每次 `insert` 去读注册表：
+    /// 一次复制读一次注册表不值当，改上限走 `set_max_entries`。
+    max_entries: i64,
 }
 
 /// UI 线程用的只读视图。
@@ -228,7 +231,11 @@ impl Store {
              PRAGMA wal_autocheckpoint = 256;",
         )?;
 
-        let store = Self { conn, blob_dir };
+        let store = Self {
+            conn,
+            blob_dir,
+            max_entries: DEFAULT_MAX_ENTRIES,
+        };
         store.migrate()?;
 
         // 启动时补一次合并。
@@ -437,9 +444,20 @@ impl Store {
         )?;
 
         // 只有真正新增才可能超限；去重只改时间戳，总数不变。
-        self.enforce_limit(MAX_ENTRIES)?;
+        self.enforce_limit(self.max_entries)?;
 
         Ok(InsertOutcome::New(self.conn.last_insert_rowid()))
+    }
+
+    /// 改条目上限，并把当前超出部分立刻淘汰掉。返回淘汰条数。
+    ///
+    /// 立刻淘汰而不是「等下次复制时顺便收拾」：用户把上限从 3 万调到 1 千，
+    /// 期望的是「现在只留 1 千」，而不是「再复制几条之后才慢慢降到 1 千」。
+    pub fn set_max_entries(&mut self, max: i64) -> Result<usize> {
+        // 0 或负数等于「一条都不留」，那不是任何人想要的结果；
+        // 上限的合理范围由调用方（设置面板）负责，这里只兜住灾难值。
+        self.max_entries = max.max(1);
+        self.enforce_limit(self.max_entries)
     }
 
     /// 超出上限时淘汰，同时删掉对应的 blob 文件。
@@ -695,6 +713,46 @@ mod tests {
         let left = read.recent(10).unwrap();
         let previews: Vec<&str> = left.iter().map(|e| e.preview.as_str()).collect();
         assert_eq!(previews, vec!["entry-4", "entry-3", "entry-2"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_max_entries_trims_immediately() {
+        let (mut store, dir) = temp_store();
+        let read = store.read_only().unwrap();
+
+        for i in 0..5 {
+            let text = format!("entry-{i}");
+            let c = Captured::new(Kind::Text, text.clone().into_bytes(), text);
+            store.insert(&c).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert_eq!(read.total().unwrap(), 5);
+
+        // 改小上限当场生效，不用等下一次复制
+        assert_eq!(store.set_max_entries(2).unwrap(), 3);
+        assert_eq!(read.total().unwrap(), 2);
+
+        // 之后插入也压在 2 条以内
+        let c = Captured::new(Kind::Text, b"entry-9".to_vec(), "entry-9".into());
+        store.insert(&c).unwrap();
+        assert_eq!(read.total().unwrap(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_max_entries_never_reaches_zero() {
+        let (mut store, dir) = temp_store();
+        let read = store.read_only().unwrap();
+        let c = Captured::new(Kind::Text, b"keep-me".to_vec(), "keep-me".into());
+        store.insert(&c).unwrap();
+
+        // 0 / 负数等于「一条不留」，兜住成 1：设置面板不该出现这种情况，
+        // 但注册表被手改成 0 时不能把用户的历史全清空。
+        store.set_max_entries(0).unwrap();
+        assert_eq!(read.total().unwrap(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -67,6 +67,8 @@ pub enum Command {
     Clear,
     /// 切换收藏标记。
     SetPinned(i64, bool),
+    /// 调整历史条目上限，超出部分立即淘汰。
+    SetLimit(i64),
     /// 关闭 worker，让主循环自然退出。
     #[allow(dead_code)]
     Shutdown,
@@ -113,6 +115,14 @@ pub fn run(rx: Receiver<Command>, store: Store, notify: crossbeam_channel::Sende
             Command::SetPinned(id, pinned) => {
                 if let Err(e) = cap.store.set_pinned(id, pinned) {
                     crate::log_warn!("收藏 #{id} 失败: {e:#}");
+                }
+                cap.nudge_ui();
+            }
+            Command::SetLimit(max) => {
+                match cap.store.set_max_entries(max) {
+                    Ok(0) => crate::log_info!("保存上限改为 {max} 条，当前未超出"),
+                    Ok(n) => crate::log_info!("保存上限改为 {max} 条，立即淘汰 {n} 条"),
+                    Err(e) => crate::log_error!("调整保存上限失败: {e:#}"),
                 }
                 cap.nudge_ui();
             }
