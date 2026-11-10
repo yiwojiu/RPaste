@@ -18,11 +18,12 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CONTROL, VK_V,
+    INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
+    VK_CONTROL, VK_V,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, FindWindowW, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP, IsIconic,
+    BringWindowToTop, FindWindowW, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HWND_TOP, IsIconic,
     IsWindowVisible, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW,
     SetForegroundWindow, SetWindowPos, ShowWindow, WM_PAINT, WS_EX_LAYERED,
 };
@@ -30,6 +31,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// eframe 主窗口的标题，`main.rs` 里 `with_title` 设的就是它。
 /// listener 用的隐藏窗口标题是 `RPasteClipboardListener`，不会撞。
 const MAIN_TITLE: &str = "R-Paste";
+
+/// 窗口重新拿到前台之后，等多久才发粘贴按键。
+///
+/// 60ms 在记事本、Chrome 这类程序上够用，但钉钉（Qt 5.15）会静默丢掉早到的
+/// 按键：它从失活回到激活时，焦点要等事件循环转一圈才还给输入框。手按
+/// Ctrl+V 能粘、自动粘贴没反应，差的就是这段时间。
+const PASTE_SETTLE: Duration = Duration::from_millis(180);
 
 /// 唤出前的前台窗口。双击粘贴时要还给它。
 static PREV_FOREGROUND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
@@ -344,21 +352,86 @@ pub fn paste_to_previous() -> bool {
     let Some(target) = previous_foreground() else {
         return false;
     };
+    let started = std::time::Instant::now();
 
     // 先把焦点还回去。此时我们的进程还握着前台权限，才切得动。
     let _ = focus_window(target);
 
     // 不管焦点成没成，自己的窗口都得收起来
     hide_main_window();
-    std::thread::sleep(Duration::from_millis(60));
+
+    // 等前台真的落回目标：hide 之后系统是把前台还给「上一个窗口」，不一定
+    // 就是我们记的那个，这里以实际状态为准，不靠 sleep 猜。
+    let switched = wait_foreground(target, Duration::from_millis(300));
+    if !switched {
+        let _ = focus_window(target);
+    }
+
+    // 拿到前台 ≠ 能接收字符。钉钉（Qt）这类程序从失活回到激活时，焦点是异步
+    // 还给输入框的：按键到得早会被静默丢掉，表现就是「手动 Ctrl+V 能粘、
+    // 自动粘贴毫无反应」。这里必须留出缓冲。
+    std::thread::sleep(PASTE_SETTLE);
 
     // 焦点不对就别乱发按键，否则会打到别的窗口上
     let now = unsafe { GetForegroundWindow() };
-    if now != target && !focus_window(target) {
+    if now != target {
+        crate::log_warn!(
+            "粘贴目标未能取回焦点：{}（当前前台 {}）",
+            describe(target),
+            describe(now)
+        );
         return false;
     }
 
-    send_ctrl_v()
+    let ok = send_ctrl_v();
+    // 这条日志是排查「在某些程序里粘不上」的第一手材料：`ok=true` 说明按键
+    // 确实投递出去了，那就是对方程序自己忽略了注入的按键（它可能只认扫描码、
+    // 或者要求窗口先进入特定状态），而不是我们这边没发。
+    crate::log_info!(
+        "粘贴 Ctrl+V → {}（{}ms，投递={ok}）",
+        describe(target),
+        started.elapsed().as_millis()
+    );
+    ok
+}
+
+/// 轮询等待前台变成 `target`。命中返回 true，超时返回 false。
+fn wait_foreground(target: HWND, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if unsafe { GetForegroundWindow() } == target {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 给日志用的窗口描述：类名 + 标题。标题可能是空的（某些自绘窗口）。
+fn describe(hwnd: HWND) -> String {
+    if hwnd.is_null() {
+        return "(空)".into();
+    }
+    unsafe {
+        let mut cls = [0u16; 128];
+        let n = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        let class = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+
+        let mut title = [0u16; 256];
+        let m = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let mut text = String::from_utf16_lossy(&title[..m.max(0) as usize]);
+        if text.chars().count() > 40 {
+            text = text.chars().take(40).collect::<String>() + "…";
+        }
+
+        if text.is_empty() {
+            format!("[{class}]")
+        } else {
+            format!("[{class}] {text}")
+        }
+    }
 }
 
 fn key(vk: u16, up: bool) -> INPUT {
@@ -366,7 +439,10 @@ fn key(vk: u16, up: bool) -> INPUT {
     input.r#type = INPUT_KEYBOARD;
     input.Anonymous.ki = KEYBDINPUT {
         wVk: vk,
-        wScan: 0,
+        // 扫描码必须填。留 0 时部分程序（winit 系、Chromium 系、以及所有按
+        // 扫描码重建按键的输入法/钩子）会把这个事件当成无来源的伪按键丢掉，
+        // 表现就是「粘贴到了 A 窗口生效、到 B 窗口毫无反应」。
+        wScan: unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16,
         dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
         time: 0,
         dwExtraInfo: 0,
