@@ -119,6 +119,17 @@ fn take_settings_request() -> bool {
     SETTINGS_REQUEST.swap(false, Ordering::Acquire)
 }
 
+/// 托盘菜单点了「关于」。与设置同理：listener 只落标志位，UI 首帧消费。
+static ABOUT_REQUEST: AtomicBool = AtomicBool::new(false);
+
+pub fn request_about() {
+    ABOUT_REQUEST.store(true, Ordering::Release);
+}
+
+fn take_about_request() -> bool {
+    ABOUT_REQUEST.swap(false, Ordering::Acquire)
+}
+
 /// 「清空历史」的确认有效期。清空不可撤销，所以点两次才执行；
 /// 两次之间超过这个时间就当用户放弃了，按钮收回待确认态。
 const CLEAR_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -231,6 +242,8 @@ pub struct App {
     overlay_opened_at: Option<f64>,
     /// 设置面板是否打开。
     settings_open: bool,
+    /// 关于面板是否打开。和设置面板互斥——两个都盖在同一层，同时开会叠成一坨。
+    about_open: bool,
     /// 设置面板里是否正在「录」新热键（等用户按键）。
     recording: bool,
     /// 设置面板里的一次性反馈：`(文案, 是否成功)`。成功用强调色，失败用红色。
@@ -301,6 +314,7 @@ impl App {
             overlay_opened_at: None,
             text_view: None,
             settings_open: false,
+            about_open: false,
             recording: false,
             setting_note: None,
             hotkey: Hotkey::load(),
@@ -557,7 +571,8 @@ impl App {
             // 窗口收起来了，设置面板没有理由留到下次唤出——用户再按热键
             // 是想看历史，不是想接着改设置。
             self.close_settings();
-        } else if !self.was_focused && focused && !self.settings_open {
+            self.close_about();
+        } else if !self.was_focused && focused && !self.settings_open && !self.about_open {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
         }
 
@@ -575,10 +590,21 @@ impl App {
     /// 面板显示的应该是「现在真正生效的」，而不是上次读到的。
     fn open_settings(&mut self) {
         self.settings_open = true;
+        self.about_open = false;
         self.recording = false;
         self.setting_note = None;
         self.hotkey = Hotkey::load();
         self.max_entries = win::settings::max_entries();
+    }
+
+    fn close_about(&mut self) {
+        self.about_open = false;
+    }
+
+    fn open_about(&mut self) {
+        // 两块卡片用同一个居中位置和同一种压暗，同时开着只会互相盖住。
+        self.close_settings();
+        self.about_open = true;
     }
 
     /// 搜索词一变就丢掉选中项。
@@ -627,6 +653,15 @@ impl App {
         // 刚录进去的那个组合，不是某条历史；按 Alt+1 更不该直接粘出去。
         if self.settings_open {
             self.handle_settings_keys(ctx);
+            return;
+        }
+
+        // 关于面板同理：它只是块牌子，但底下压着列表，按键必须拦住，
+        // 否则盖着牌子按 Del 会把一条看不见的历史删掉。
+        if self.about_open {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.close_about();
+            }
             return;
         }
 
@@ -854,6 +889,7 @@ impl App {
         let mut start_recording = false;
         let mut reset_hotkey = false;
         let mut reset_size = false;
+        let mut open_about = false;
         let mut new_limit: Option<i64> = None;
 
         egui::Window::new("settings-card")
@@ -1009,6 +1045,13 @@ impl App {
                 // 收尾按钮必须包在 `ui.horizontal` 里：裸 `with_layout` 会拿到
                 // 整块剩余高度，把它撑成一条从内容底部到窗口底部的空白。
                 ui.horizontal(|ui| {
+                    // 左边「关于」、右边「完成」：关于不是主操作，但放在设置里
+                    // 是唯一不离开键盘就能查到版本的路径（Ctrl+K 之后）。
+                    if ghost_button(ui, egui::Id::new("settings-about"), "关于", theme::ACCENT, false)
+                        .clicked()
+                    {
+                        open_about = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ghost_button(
                             ui,
@@ -1062,6 +1105,126 @@ impl App {
         }
         if close || clicked_outside {
             self.close_settings();
+        }
+        if open_about {
+            self.open_about();
+        }
+    }
+
+    /// 关于面板：版本号 + 两个「找得到人」的入口。
+    ///
+    /// 刻意不做成「设置里的一个小节」：想查版本的人第一反应是去托盘找关于，
+    /// 而不是翻设置。两个入口（托盘菜单、面板里的关于按钮）都走这里。
+    fn ui_about(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let screen = ctx.content_rect();
+
+        let mut clicked_outside = false;
+        egui::Area::new(egui::Id::new("about-dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
+                clicked_outside = resp.clicked();
+            });
+
+        let visuals = ctx.style().visuals.clone();
+        let data_dir = crate::data_dir();
+        let data_dir_text = data_dir.display().to_string();
+        let mut close = false;
+        let mut open_dir = false;
+        let mut open_repo = false;
+
+        egui::Window::new("about-card")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(visuals.window_fill)
+                    .stroke(visuals.window_stroke)
+                    .corner_radius(theme::RADIUS_LG)
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(290.0);
+
+                // 名字 + 版本放在同一行：版本是这块面板存在的理由，不该被
+                // 挤到下面小字里。`v` 前缀用弱色，数字用正常色，扫一眼就能读出。
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("R-Paste")
+                            .size(theme::FONT_TITLE + 3.0)
+                            .strong(),
+                    );
+                    ui.add_space(theme::GAP_SM);
+                    ui.label(
+                        egui::RichText::new(format!("v{}", win::tray::VERSION))
+                            .size(theme::FONT_BODY)
+                            .color(theme::ACCENT)
+                            .monospace(),
+                    );
+                });
+                ui.add_space(theme::GAP_XS);
+                hint_label(ui, "Windows 剪贴板历史工具");
+
+                ui.add_space(theme::GAP_LG);
+                ui.separator();
+                ui.add_space(theme::GAP_MD);
+
+                // ---- 数据目录
+                section_label(ui, "数据目录");
+                ui.add_space(theme::GAP_SM);
+                if link_label(ui, &data_dir_text, theme::ACCENT).clicked() {
+                    open_dir = true;
+                }
+                ui.add_space(theme::GAP_XS);
+                hint_label(ui, "历史库与日志都在这里，点一下打开文件夹。");
+
+                // ---- 项目主页
+                ui.add_space(theme::GAP_MD);
+                section_label(ui, "项目主页");
+                ui.add_space(theme::GAP_SM);
+                let repo = env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://");
+                if link_label(ui, repo, theme::ACCENT).clicked() {
+                    open_repo = true;
+                }
+                ui.add_space(theme::GAP_XS);
+                hint_label(ui, "遇到问题或有想法，欢迎提 issue。");
+
+                ui.add_space(theme::GAP_LG);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ghost_button(
+                            ui,
+                            egui::Id::new("about-done"),
+                            "关闭",
+                            theme::ACCENT,
+                            false,
+                        )
+                        .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if open_dir {
+            win::shell::open(&data_dir_text);
+        }
+        if open_repo {
+            win::shell::open(env!("CARGO_PKG_REPOSITORY"));
+        }
+        if close || clicked_outside {
+            self.close_about();
         }
     }
 
@@ -1924,6 +2087,10 @@ impl eframe::App for App {
             self.open_settings();
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("search")));
         }
+        if take_about_request() {
+            self.open_about();
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("search")));
+        }
 
         self.tick_focus(ctx);
         self.poll_notify();
@@ -1982,6 +2149,8 @@ impl eframe::App for App {
 
         // 设置面板盖在最上层（Foreground），要最后画，否则会被面板内容盖住。
         self.ui_settings(ctx);
+        // 关于面板同理，且它和设置互斥，谁开着就画谁。
+        self.ui_about(ctx);
         // 尺寸落盘放在最后：这一帧的 `content_rect` 包含了本轮所有视口命令的结果。
         self.persist_window_size(ctx);
     }
@@ -2219,6 +2388,22 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
 /// 设置面板里的说明文字：弱化、小一号，但不到看不清。
 fn hint_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(theme::FONT_SM).weak());
+}
+
+/// 可点击的一行文字（关于面板里的路径、网址）。
+///
+/// 不画下划线也不做成按钮：这里是「顺手能点」的辅助信息，画成按钮会跟
+/// 面板底部的「关闭」抢注意力。hover 变手型 + 颜色加深，足够说明它能点。
+fn link_label(ui: &mut egui::Ui, text: &str, accent: egui::Color32) -> egui::Response {
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(text).size(theme::FONT_SM).color(accent))
+            .sense(egui::Sense::click())
+            .truncate(),
+    );
+    if resp.hovered() {
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+    }
+    resp
 }
 
 /// 列表里的预览行：等宽字体、最多 `PREVIEW_ROWS` 行、超出用省略号收尾。

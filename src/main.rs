@@ -12,8 +12,6 @@
 // 只作用于这个 bin target；examples/ 下的测试工具仍是普通控制台程序。
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use std::path::PathBuf;
-
 use crossbeam_channel::{bounded, unbounded};
 use eframe::egui;
 
@@ -31,7 +29,7 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let root = data_dir();
+    let root = rpaste::data_dir();
     std::fs::create_dir_all(&root)?;
     rpaste::log::init(&root);
     rpaste::log_info!("===== R-Paste 启动 =====");
@@ -139,11 +137,4 @@ fn run() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe 启动失败: {e}"))?;
 
     Ok(())
-}
-
-fn data_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("RPaste")
 }

@@ -213,6 +213,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                     window::show_at_cursor_keep_target();
                     crate::log_info!("托盘：打开设置");
                 }
+                tray::TrayAction::About => {
+                    // 同上：先落标志位再唤出，顺序反了标志位会没人消费。
+                    crate::ui::request_about();
+                    window::show_at_cursor_keep_target();
+                    crate::log_info!("托盘：打开关于（v{}）", tray::VERSION);
+                }
                 tray::TrayAction::ToggleAutostart => match super::autostart::toggle() {
                     Ok(on) => crate::log_info!("开机自启已{}", if on { "开启" } else { "关闭" }),
                     Err(err) => crate::log_error!("切换开机自启失败: {err}"),

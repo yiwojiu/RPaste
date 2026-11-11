@@ -24,8 +24,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const LISTENER_TITLE: &str = "RPasteClipboardListener";
 /// 托盘回调消息，`WM_APP + 1`（见 `src/win/tray.rs`）。
 const TRAY_MSG: u32 = 0x8000 + 1;
-/// 托盘菜单里「设置…」是第几项（从 1 数）。
+/// 托盘菜单里「设置…」是第几项（从 1 数，分隔线由菜单自己跳过）。
 const SETTINGS_ITEM: usize = 2;
+/// 「关于 …」是第几项。macOS 之外没人约定关于放哪，这里跟着菜单顺序走。
+const ABOUT_ITEM: usize = 4;
 
 fn key(vk: u16, up: bool) -> INPUT {
     // 扫描码不能省：winit 用 `lParam` 里的扫描码判断**物理键**，只填虚拟键码
@@ -147,11 +149,16 @@ fn main() {
         return;
     }
 
-    // `win_state tray-settings`：模拟右键托盘图标 → 选「设置…」。
+    // `win_state tray-settings` / `tray-about`：模拟右键托盘图标 → 选对应项。
     //
     // 给 listener 窗口发托盘回调消息把菜单弹出来，再往菜单窗口里投一次点击。
     // 全程不用 `SendInput`：那需要前台权限，脚本没有。
-    if args.first().is_some_and(|a| a == "tray-settings") {
+    let tray_item = match args.first().map(String::as_str) {
+        Some("tray-settings") => Some(SETTINGS_ITEM),
+        Some("tray-about") => Some(ABOUT_ITEM),
+        _ => None,
+    };
+    if let Some(item) = tray_item {
         let title: Vec<u16> = LISTENER_TITLE.encode_utf16().chain(Some(0)).collect();
         let listener = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
         if listener.is_null() {
@@ -184,7 +191,7 @@ fn main() {
         // `SetForegroundWindow` 基本都会被拒），键会落到别的程序上。
         // 投递到窗口的消息不经过输入队列，和前台是谁无关。
         unsafe {
-            for _ in 0..SETTINGS_ITEM {
+            for _ in 0..item {
                 PostMessageW(menu, WM_KEYDOWN, 0x28, 0); // VK_DOWN
                 PostMessageW(menu, WM_KEYUP, 0x28, 0);
             }

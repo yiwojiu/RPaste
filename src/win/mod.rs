@@ -6,6 +6,7 @@ pub mod hook;
 pub mod hotkey;
 pub mod listener;
 pub mod settings;
+pub mod shell;
 pub mod single;
 pub mod tray;
 pub mod window;

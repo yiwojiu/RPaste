@@ -13,3 +13,14 @@ pub mod theme;
 pub mod thumb;
 pub mod ui;
 pub mod win;
+
+/// 数据目录：`%LOCALAPPDATA%\RPaste`（没有 `LOCALAPPDATA` 时退到临时目录）。
+///
+/// bin 和关于面板都要显示/使用这个路径，所以只在这里拼一次。分开拼的话，
+/// 「关于里显示的目录」和「实际存的地方」迟早会对不上。
+pub fn data_dir() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("RPaste")
+}

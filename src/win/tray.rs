@@ -29,13 +29,22 @@ const TRAY_UID: u32 = 1;
 const MENU_TOGGLE: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_AUTOSTART: usize = 3;
-const MENU_QUIT: usize = 4;
+const MENU_ABOUT: usize = 4;
+const MENU_QUIT: usize = 5;
+
+/// 当前版本，取自 `Cargo.toml`。
+///
+/// 发版只需要改 `Cargo.toml` 一处，托盘菜单、悬停提示、关于面板会一起跟上——
+/// 手工维护三份字符串迟早会漏一个。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 用户在托盘菜单里选了什么，或者点了图标本身。
 pub enum TrayAction {
     Toggle,
     /// 唤出窗口并打开设置面板。
     Settings,
+    /// 唤出窗口并打开关于面板。
+    About,
     /// 切换开机自启。
     ToggleAutostart,
     Quit,
@@ -117,7 +126,10 @@ pub fn add(hwnd: HWND) -> bool {
     nid.uCallbackMessage = TRAY_MSG;
     nid.hIcon = load_icon() as *mut _;
 
-    let tip: Vec<u16> = "R-Paste 剪贴板历史\0".encode_utf16().collect();
+    // 版本号放进悬停提示：想看版本时不必先点开菜单。
+    let tip: Vec<u16> = format!("R-Paste 剪贴板历史 v{VERSION}\0")
+        .encode_utf16()
+        .collect();
     let n = tip.len().min(nid.szTip.len());
     nid.szTip[..n].copy_from_slice(&tip[..n]);
 
@@ -154,6 +166,9 @@ fn show_menu(hwnd: HWND) -> TrayAction {
         let settings: Vec<u16> = "设置…\0".encode_utf16().collect();
         // 勾选状态直接读注册表，不维护自己的副本——用户可能在别处改过
         let autostart: Vec<u16> = "开机自启\0".encode_utf16().collect();
+        // 版本直接写进菜单项：用户第一眼想看的就是「我装的是哪个版本」，
+        // 不该还得再点一层。
+        let about: Vec<u16> = format!("关于 R-Paste v{VERSION}…\0").encode_utf16().collect();
         let quit: Vec<u16> = "退出\0".encode_utf16().collect();
 
         AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle.as_ptr());
@@ -169,6 +184,7 @@ fn show_menu(hwnd: HWND) -> TrayAction {
         AppendMenuW(menu, auto_flags, MENU_AUTOSTART, autostart.as_ptr());
 
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(menu, MF_STRING, MENU_ABOUT, about.as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_QUIT, quit.as_ptr());
 
         let mut pt = POINT { x: 0, y: 0 };
@@ -192,6 +208,7 @@ fn show_menu(hwnd: HWND) -> TrayAction {
             MENU_TOGGLE => TrayAction::Toggle,
             MENU_SETTINGS => TrayAction::Settings,
             MENU_AUTOSTART => TrayAction::ToggleAutostart,
+            MENU_ABOUT => TrayAction::About,
             MENU_QUIT => TrayAction::Quit,
             _ => TrayAction::None,
         }
