@@ -19,12 +19,12 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput,
-    VK_CONTROL, VK_V,
+    SetFocus, VK_CONTROL, VK_V,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, FindWindowW, GUITHREADINFO, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindowVisible, PostMessageW, SW_HIDE,
+    GetWindowThreadProcessId, HWND_TOP, IsChild, IsIconic, IsWindowVisible, PostMessageW, SW_HIDE,
     SW_RESTORE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
     WM_PAINT, WS_EX_LAYERED,
 };
@@ -33,16 +33,31 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// listener 用的隐藏窗口标题是 `RPasteClipboardListener`，不会撞。
 const MAIN_TITLE: &str = "R-Paste";
 
-/// 等目标线程交出输入焦点的上限。
-///
-/// 实测钉钉（Qt 5.15）在重新激活后约 530ms 才把焦点还给输入框，留一倍余量。
+/// 等目标线程交出输入焦点的上限（只在拿不到「原来那个控件」时用）。
 const FOCUS_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// 焦点出现后再等一小会儿：它先落到顶层窗口，再交给输入框子窗口。
 const FOCUS_SETTLE: Duration = Duration::from_millis(80);
 
+/// 给了「原来那个控件」时，先等它自己回来这么久；等不到就自己塞回去。
+///
+/// 正常程序 10~20ms 就把焦点还回原控件，60ms 已经给了三次轮询余量；再长就是
+/// 白等——实测钉钉根本不会还（等 1.5s 也不还），多等只会让双击显得更钝。
+const FOCUS_SELF_RETURN: Duration = Duration::from_millis(60);
+
 /// 唤出前的前台窗口。双击粘贴时要还给它。
 static PREV_FOREGROUND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// 唤出前那个窗口里的**控件级**焦点（输入框那一类的子窗口）。
+///
+/// 只记顶层窗口不够。Qt 程序（钉钉）从失活恢复时只把焦点还给顶层窗口，
+/// 输入框子窗口的焦点不会自动回来——而 `GetGUIThreadInfo` 的 `hwndFocus`
+/// 从此就停在顶层窗口上，看着「有焦点」。此时注入的 Ctrl+V 落在没有输入
+/// 控件的窗口上被直接丢弃，表现就是「手动按能粘、自动粘贴一点反应都没有」。
+///
+/// 实测：不等它自己回来（1.5s 也不回来），必须主动 `SetFocus` 到记下的
+/// 那个子窗口，粘上才成立。
+static PREV_FOCUS: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -80,6 +95,19 @@ fn show_at_cursor_inner(remember_target: bool) {
         let prev = GetForegroundWindow();
         if remember_target && !prev.is_null() && prev != hwnd {
             PREV_FOREGROUND.store(prev, Ordering::Relaxed);
+            // 连控件级焦点一起记下来：面板一露头，对方的控件焦点就被清掉了，
+            // 而且不会自己回来。
+            let focus = focused_window(prev);
+            crate::log_info!(
+                "唤出前焦点 {} · 控件 {}",
+                describe(prev),
+                if focus.is_null() {
+                    "(无)".to_owned()
+                } else {
+                    describe(focus)
+                }
+            );
+            PREV_FOCUS.store(focus, Ordering::Relaxed);
         }
 
         let mut pt = POINT { x: 0, y: 0 };
@@ -370,14 +398,20 @@ pub fn paste_to_previous() -> bool {
     }
 
     // 拿到前台 ≠ 能接收按键。真正决定按键会不会被丢弃的是**窗口线程有没有
-    // 焦点窗口**：Qt 程序（钉钉）失活时会把焦点清掉，重新激活后要 500ms
-    // 左右才异步还回来。早发的 Ctrl+V 落在空焦点上，被静默丢弃——这正是
-    // 「手动按能粘、自动粘贴没反应」的原因。
+    // 焦点窗口**：程序失活时会把焦点清掉，重新激活后什么时候还回来、还给
+    // 哪个窗口，完全由它自己决定。
     //
-    // 所以这里按状态等而不是按时间等：记事本、Chrome 这类通常 10~20ms 就有
-    // 焦点，不会因此变慢；只有真的慢的程序才会等到它准备好。
+    // 记事本、Chrome 这类通常 10~20ms 就把焦点还给原来那个控件；Qt 程序
+    // （钉钉）只还给顶层窗口，输入框的焦点再也不回来——所以唤出时记下了
+    // 控件级焦点（`PREV_FOCUS`），这里等不到就自己塞回去。
     let focus_started = std::time::Instant::now();
-    let focused = wait_input_focus(target, FOCUS_TIMEOUT);
+    let want = PREV_FOCUS.load(Ordering::Relaxed);
+    let has_want = !want.is_null() && want != target && unsafe { IsChild(target, want) } != 0;
+    let focused = if has_want {
+        wait_focus_hwnd(target, want, FOCUS_SELF_RETURN) || restore_focus(target, want)
+    } else {
+        wait_input_focus(target, FOCUS_TIMEOUT)
+    };
     let focus_ms = focus_started.elapsed().as_millis();
 
     // 焦点先给顶层窗口、再给输入框子窗口，多留一点让它落定。
@@ -404,12 +438,12 @@ pub fn paste_to_previous() -> bool {
 
     let ok = send_ctrl_v();
     // 这条日志是排查「在某些程序里粘不上」的第一手材料：`ok=true` 说明按键
-    // 确实投递出去了，那就是对方程序自己忽略了注入的按键（它可能只认扫描码、
-    // 或者要求窗口先进入特定状态），而不是我们这边没发。
+    // 确实投递出去了，那就是对方程序自己忽略了注入的按键，而不是我们没发。
     crate::log_info!(
-        "粘贴 Ctrl+V → {}（{}ms，等焦点 {focus_ms}ms，投递={ok}）",
+        "粘贴 Ctrl+V → {}（{}ms，焦点 {focus_ms}ms{}，投递={ok}）",
         describe(target),
-        started.elapsed().as_millis()
+        started.elapsed().as_millis(),
+        if has_want { "·控件级" } else { "" }
     );
     ok
 }
@@ -417,19 +451,21 @@ pub fn paste_to_previous() -> bool {
 /// 等目标窗口所在线程拿到输入焦点（`hwndFocus` 非空）。
 ///
 /// `GetForegroundWindow` 只说「这个窗口在最前」，不说「按键会进到它」。
-/// 没有焦点窗口的线程收到键盘消息会直接丢弃，而焦点什么时候回来完全由
-/// 对方程序决定（Qt 程序实测 ~530ms，且先给顶层窗口、再给输入框子窗口）。
+/// 没有焦点窗口的线程收到键盘消息会直接丢弃。
 fn wait_input_focus(target: HWND, timeout: Duration) -> bool {
-    let tid = unsafe { GetWindowThreadProcessId(target, ptr::null_mut()) };
-    if tid == 0 {
-        return false;
-    }
+    wait_focus_where(target, timeout, |f| !f.is_null())
+}
 
+/// 等目标线程的焦点窗口变成 `want` 这个具体控件。
+fn wait_focus_hwnd(target: HWND, want: HWND, timeout: Duration) -> bool {
+    wait_focus_where(target, timeout, |f| f == want)
+}
+
+/// 轮询目标窗口所在线程的焦点窗口，`done` 判定命中即返回。
+fn wait_focus_where(target: HWND, timeout: Duration, done: impl Fn(HWND) -> bool) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let mut info: GUITHREADINFO = unsafe { zeroed() };
-        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-        if unsafe { GetGUIThreadInfo(tid, &mut info) } != 0 && !info.hwndFocus.is_null() {
+        if done(focused_window(target)) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -437,6 +473,58 @@ fn wait_input_focus(target: HWND, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// 读某窗口所在线程当前的焦点窗口（控件级，`hwndFocus`）。
+fn focused_window(target: HWND) -> HWND {
+    let tid = unsafe { GetWindowThreadProcessId(target, ptr::null_mut()) };
+    if tid == 0 {
+        return ptr::null_mut();
+    }
+    let mut info: GUITHREADINFO = unsafe { zeroed() };
+    info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    if unsafe { GetGUIThreadInfo(tid, &mut info) } == 0 {
+        return ptr::null_mut();
+    }
+    info.hwndFocus
+}
+
+/// 主动把控件级焦点塞回 `focus`。
+///
+/// `SetFocus` 只对**本线程**的窗口有效，所以得先挂到对方的输入队列上；
+/// 完事立刻摘掉，免得把我们两个线程的输入状态粘在一起。
+///
+/// 这一步是给「自己不恢复焦点」的程序兜底的：对正常程序焦点早就回来了，
+/// 根本走不到这里。
+fn restore_focus(target: HWND, focus: HWND) -> bool {
+    let tid = unsafe { GetWindowThreadProcessId(target, ptr::null_mut()) };
+    if tid == 0 {
+        return false;
+    }
+    unsafe {
+        let my = GetCurrentThreadId();
+        let attached = tid != my && AttachThreadInput(my, tid, 1) != 0;
+        SetFocus(focus);
+        if attached {
+            AttachThreadInput(my, tid, 0);
+        }
+    }
+    // SetFocus 是同步的，但对方的消息循环可能立刻又改了焦点，所以复查一次。
+    for _ in 0..3 {
+        if focused_window(target) == focus {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        unsafe {
+            let my = GetCurrentThreadId();
+            let attached = tid != my && AttachThreadInput(my, tid, 1) != 0;
+            SetFocus(focus);
+            if attached {
+                AttachThreadInput(my, tid, 0);
+            }
+        }
+    }
+    focused_window(target) == focus
 }
 
 /// 轮询等待前台变成 `target`。命中返回 true，超时返回 false。

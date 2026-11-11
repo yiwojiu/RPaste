@@ -16,7 +16,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetForegroundWindow, GetWindowRect, IsWindowVisible, PostMessageW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, WM_KEYDOWN, WM_KEYUP, WM_RBUTTONUP, WindowFromPoint,
+    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP,
+    WindowFromPoint,
 };
 
 /// listener 隐藏窗口的标题（见 `src/win/listener.rs`）。
@@ -126,6 +127,23 @@ fn main() {
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
+        return;
+    }
+
+    // `win_state tray-toggle`：模拟左键点托盘图标 → 唤出/收起主窗口。
+    // 和热键走的是同一条生产路径（`toggle_main_window` → `show_at_cursor`），
+    // 但不依赖组合键注册，脚本里也能用。
+    if args.first().is_some_and(|a| a == "tray-toggle") {
+        let title: Vec<u16> = LISTENER_TITLE.encode_utf16().chain(Some(0)).collect();
+        let listener = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if listener.is_null() {
+            println!("找不到 listener 窗口（进程没在跑？）");
+            return;
+        }
+        unsafe {
+            PostMessageW(listener, TRAY_MSG, 0, WM_LBUTTONUP as isize);
+        }
+        println!("已发送托盘左键消息");
         return;
     }
 
