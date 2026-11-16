@@ -90,6 +90,11 @@ pub fn show_at_cursor_keep_target() {
 fn show_at_cursor_inner(remember_target: bool) {
     let Some(hwnd) = main_window() else { return };
 
+    // 每一次唤出都是一次新的意愿：上一次翻到第几页、搜了什么，不带过来。
+    // 放在这里而不是 UI 的焦点回调里，是因为粘贴那条路径下窗口是 worker 直接
+    // `SW_HIDE` 的，UI 压根看不到「失焦」那一帧。
+    crate::ui::request_reset();
+
     unsafe {
         // 记住现在谁在前台，粘贴时用得上。必须在抢焦点之前取。
         let prev = GetForegroundWindow();

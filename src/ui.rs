@@ -130,6 +130,25 @@ fn take_about_request() -> bool {
     ABOUT_REQUEST.swap(false, Ordering::Acquire)
 }
 
+/// 窗口刚被唤出。
+///
+/// 视图状态（搜索词、类型筛选、选中项、滚动位置）不跨唤出保留：这个窗口一失焦
+/// 就自动收起，「再按一次热键」几乎总是一次新的意愿，而不是「接着刚才那页看」。
+/// 保留半截状态的结果是：翻到第五页粘完，下次唤出还停在第五页，看不见刚复制的
+/// 东西；更糟的是一条看不见的选中项还挂着，`Delete` 会删掉屏幕外的记录。
+///
+/// 用标志位而不是在 `tick_focus` 里检测焦点变化：粘贴后窗口是 worker 线程直接
+/// `SW_HIDE` 的，UI 从没看到过「失焦」那一帧，`was_focused` 会一直停在 true。
+static RESET_REQUEST: AtomicBool = AtomicBool::new(false);
+
+pub fn request_reset() {
+    RESET_REQUEST.store(true, Ordering::Release);
+}
+
+fn take_reset_request() -> bool {
+    RESET_REQUEST.swap(false, Ordering::Acquire)
+}
+
 /// 「清空历史」的确认有效期。清空不可撤销，所以点两次才执行；
 /// 两次之间超过这个时间就当用户放弃了，按钮收回待确认态。
 const CLEAR_CONFIRM_TTL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -209,6 +228,11 @@ pub struct App {
     /// 下一帧要把选中项滚进可视区。只在键盘移动选中时置位——
     /// 否则用户用滚轮翻看时会被一直拽回选中项。
     scroll_to_selected: bool,
+    /// 下一帧把列表滚回顶部。只在唤出后的第一帧为真。
+    ///
+    /// 不能每帧都把偏移设成 0——那样列表根本滚不动。滚动偏移本身由 egui 的
+    /// `ScrollArea` 记着，隐藏窗口不会丢，所以「回到最新」必须显式按回去。
+    scroll_to_top: bool,
     /// 上一帧窗口是否有焦点。用来检测「刚刚失焦」这一刻。
     was_focused: bool,
     /// 「清空历史」的一次确认。点第一次记时间，3 秒内再点才真的清。
@@ -305,6 +329,7 @@ impl App {
             selected: None,
             search_snapshot: String::new(),
             scroll_to_selected: false,
+            scroll_to_top: false,
             was_focused: false,
             confirm_clear: None,
             missing_paths: HashMap::new(),
@@ -605,6 +630,28 @@ impl App {
         // 两块卡片用同一个居中位置和同一种压暗，同时开着只会互相盖住。
         self.close_settings();
         self.about_open = true;
+    }
+
+    /// 唤出时把视图拨回「刚打开」的样子。
+    ///
+    /// 清空的东西看着多，但它们其实是同一件事：**上一次翻到哪里不该带到这一次**。
+    /// 具体代价说清楚——搜索词也会没，切出去确认一眼再回来要重打。换来的是
+    /// 「按热键 = 看到最新的几条」这个可以闭眼依赖的确定感，以及不会误删屏幕外的
+    /// 记录。`Alt+1..9` 本来就是直达第 N 条，不靠记住上次位置省按键。
+    fn reset_view_state(&mut self) {
+        self.search.clear();
+        self.search_snapshot.clear();
+        self.filter = KindFilter::All;
+        // 选中项和浮层一起清：浮层显示的是「某一条」，选中项没了还盖着图和文字
+        // 就没有对应的记录了。`cached_key` 不用动，`filtered()` 按 (筛选, 搜索词)
+        // 比对，键变了自然重查。
+        self.selected = None;
+        self.scroll_to_selected = false;
+        self.scroll_to_top = true;
+        self.preview_id = None;
+        self.text_view = None;
+        self.overlay_opened_at = None;
+        self.hover_row = None;
     }
 
     /// 搜索词一变就丢掉选中项。
@@ -1475,12 +1522,17 @@ impl App {
         let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
         // 先取快照：渲染过程中不能一边读一边清，否则后面的条目判断就乱了。
         let scroll_to_selected = self.scroll_to_selected;
+        // 滚回顶部同样只做一次：`vertical_scroll_offset` 每帧都设的话，
+        // 用户就再也滚不动列表了。
+        let scroll_to_top = std::mem::take(&mut self.scroll_to_top);
         // 本帧鼠标落在哪一行，循环结束后写回 `hover_row`（供下一帧绘制底色）。
         let mut next_hover = None;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if scroll_to_top {
+            area = area.vertical_scroll_offset(0.0);
+        }
+        area.show(ui, |ui| {
                 if entries.is_empty() {
                     ui.centered_and_justified(|ui| {
                         let hint = if searching {
@@ -2083,6 +2135,10 @@ impl eframe::App for App {
         // 托盘「设置」：listener 已经把窗口唤出来了，这里补上面板状态。
         // 必须早于 `tick_focus`——否则这一帧的「刚获得焦点 → 聚焦搜索框」
         // 会先把焦点塞给搜索框，面板刚开就要再抢一次。
+        // 唤出后的第一帧：把上次翻到哪、搜了什么全拨回去。
+        if take_reset_request() {
+            self.reset_view_state();
+        }
         if take_settings_request() {
             self.open_settings();
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("search")));
