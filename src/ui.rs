@@ -922,16 +922,23 @@ impl App {
         }
         let screen = ctx.content_rect();
 
-        // 压暗。点空白处收起——这层在卡片之前创建，所以永远画在卡片下面。
-        let mut clicked_outside = false;
+        // 压暗。点空白处收起。
+        //
+        // **order 必须比卡片低**：同属 `Foreground` 时，两层谁在上面取决于
+        // 该帧的 show 顺序，而顺序并不稳定——第二次打开面板时遮罩就跑到了卡片
+        // 上面，于是点卡片任何位置都被遮罩当成「点了外面」，面板一闪就关。
+        // 用 `Middle` 把它钉在列表（CentralPanel）之上、卡片（Foreground）之下。
+        let mut clicked_pos: Option<egui::Pos2> = None;
         egui::Area::new(egui::Id::new("settings-dim"))
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
                 ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
-                clicked_outside = resp.clicked();
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(theme::DIM_ALPHA));
+                if resp.clicked() {
+                    clicked_pos = resp.interact_pointer_pos();
+                }
             });
 
         let visuals = ctx.style().visuals.clone();
@@ -1153,6 +1160,15 @@ impl App {
                 Err(err) => self.setting_note = Some((err, false)),
             }
         }
+        // 点在卡片上永远不算「点了外面」。
+        //
+        // 这层判定本该由 order 保证（遮罩 Middle、卡片 Foreground），但「用户点
+        // 按钮却把面板关掉」这个后果太重，多一道几何判断不亏——层序再出意外时，
+        // 最差也只是按钮没反应，不会把面板吞掉。
+        let clicked_outside = clicked_pos.is_some_and(|p| {
+            ctx.memory(|m| m.area_rect(egui::Id::new("settings-card")))
+                .is_none_or(|r| !r.contains(p))
+        });
         if close || clicked_outside {
             self.close_settings();
         }
@@ -1171,15 +1187,17 @@ impl App {
         }
         let screen = ctx.content_rect();
 
-        let mut clicked_outside = false;
+        let mut clicked_pos: Option<egui::Pos2> = None;
         egui::Area::new(egui::Id::new("about-dim"))
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
                 ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
-                clicked_outside = resp.clicked();
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(theme::DIM_ALPHA));
+                if resp.clicked() {
+                    clicked_pos = resp.interact_pointer_pos();
+                }
             });
 
         let visuals = ctx.style().visuals.clone();
@@ -1273,6 +1291,10 @@ impl App {
         if open_repo {
             win::shell::open(env!("CARGO_PKG_REPOSITORY"));
         }
+        let clicked_outside = clicked_pos.is_some_and(|p| {
+            ctx.memory(|m| m.area_rect(egui::Id::new("about-card")))
+                .is_none_or(|r| !r.contains(p))
+        });
         if close || clicked_outside {
             self.close_about();
         }
